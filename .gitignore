@@ -1,0 +1,31 @@
+# Binaries & Compiled Artifacts
+*.dll
+*.exe
+*.so
+*.dylib
+*.lib
+*.pdb
+*.exp
+*.o
+*.obj
+*.a
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Environment Variables & Secrets
+.env*
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

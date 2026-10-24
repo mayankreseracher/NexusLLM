@@ -1,0 +1,9 @@
+[package]
+name = "nexus-infer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus High-Performance Systems"]
+description = "Ultra-high throughput heterogeneous-tiered LLM inference engine bindings in Rust"
+
+[dependencies]
+libc = "0.2"
