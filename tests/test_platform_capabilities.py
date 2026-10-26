@@ -1,5 +1,17 @@
 import unittest
-from nexus_engine.python.nexus_llm.bindings import NexusNativeEngine
+import sys
+from pathlib import Path
+
+repo_root = Path(__file__).resolve().parent.parent
+python_dir = repo_root / "python"
+for p in [str(python_dir), str(repo_root), str(repo_root.parent)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from nexus_llm.bindings import NexusNativeEngine
+except ImportError:
+    from nexus_engine.python.nexus_llm.bindings import NexusNativeEngine
 
 class TestPlatformCapabilities(unittest.TestCase):
     def test_platform_capabilities_detection(self):

@@ -11,11 +11,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .bindings import NexusNativeEngine
-from .memory_manager import DynamicMemoryTierManager
-from .prefix_cache import RadixPrefixCache
-from .continuous_batcher import ContinuousBatchEngine
-from .universal_loader import UniversalModelLoader
+try:
+    from .bindings import NexusNativeEngine
+    from .memory_manager import DynamicMemoryTierManager
+    from .prefix_cache import RadixPrefixCache
+    from .continuous_batcher import ContinuousBatchEngine
+    from .universal_loader import UniversalModelLoader
+except (ImportError, ValueError):
+    import sys
+    from pathlib import Path
+    pkg_root = Path(__file__).resolve().parent.parent
+    if str(pkg_root) not in sys.path:
+        sys.path.insert(0, str(pkg_root))
+    from nexus_llm.bindings import NexusNativeEngine
+    from nexus_llm.memory_manager import DynamicMemoryTierManager
+    from nexus_llm.prefix_cache import RadixPrefixCache
+    from nexus_llm.continuous_batcher import ContinuousBatchEngine
+    from nexus_llm.universal_loader import UniversalModelLoader
 
 app = FastAPI(title="NexusLLM High-Throughput Inference Engine", version="2026.1.0")
 

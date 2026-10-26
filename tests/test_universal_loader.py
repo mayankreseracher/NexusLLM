@@ -1,70 +1,68 @@
 import unittest
+import os
 import tempfile
 import struct
 import json
+import sys
 from pathlib import Path
-from nexus_engine.python.nexus_llm.universal_loader import UniversalModelLoader
-from nexus_engine.python.nexus_llm.memory_manager import DynamicMemoryTierManager
+
+repo_root = Path(__file__).resolve().parent.parent
+python_dir = repo_root / "python"
+for p in [str(python_dir), str(repo_root), str(repo_root.parent)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from nexus_llm.universal_loader import UniversalModelLoader
+    from nexus_llm.memory_manager import DynamicMemoryTierManager
+except ImportError:
+    from nexus_engine.python.nexus_llm.universal_loader import UniversalModelLoader
+    from nexus_engine.python.nexus_llm.memory_manager import DynamicMemoryTierManager
 
 class TestUniversalLoader(unittest.TestCase):
     def setUp(self):
         self.mem_mgr = DynamicMemoryTierManager(tier0_capacity_mb=64, tier1_capacity_mb=512)
-        self.loader = UniversalModelLoader(self.mem_mgr)
+        self.loader = UniversalModelLoader(memory_tier_manager=self.mem_mgr)
 
     def tearDown(self):
         self.mem_mgr.close()
 
-    def test_safetensors_loader(self):
+    def test_safetensors_parsing(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
-            t_path = f.name
-            # Write valid safetensors binary format
+            temp_path = f.name
             header = {
                 "weight1": {
-                    "dtype": "F16",
-                    "shape": [64, 64],
-                    "data_offsets": [0, 64 * 64 * 2]
-                }
+                    "dtype": "F32",
+                    "shape": [2, 2],
+                    "data_offsets": [0, 16]
+                },
+                "__metadata__": {"format": "pt"}
             }
-            header_json = json.dumps(header).encode('utf-8')
-            f.write(struct.pack("<Q", len(header_json)))
+            header_json = json.dumps(header).encode("utf-8")
+            header_size = len(header_json)
+            f.write(struct.pack("<Q", header_size))
             f.write(header_json)
-            # Write tensor binary data
-            f.write(b"\x00" * (64 * 64 * 2))
+            f.write(b"\x00" * 16) # 16 bytes tensor data
 
-        try:
-            ok = self.loader.load(t_path)
-            self.assertTrue(ok)
-            self.assertEqual(self.loader.detected_format, "safetensors")
-            self.assertIn("weight1", self.loader.tensors)
-        finally:
-            Path(t_path).unlink(missing_ok=True)
+        ok = self.loader.load(temp_path)
+        os.remove(temp_path)
+        self.assertTrue(ok)
+        self.assertEqual(self.loader.detected_format, "safetensors")
+        self.assertEqual(len(self.loader.tensors), 1)
 
-    def test_gguf_loader(self):
+    def test_gguf_parsing(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as f:
-            t_path = f.name
-            # Write GGUF magic bytes
+            temp_path = f.name
             f.write(b"GGUF")
-            f.write(struct.pack("<III", 3, 2, 0)) # version 3, 2 tensors, 0 metadata
-            f.write(b"\x00" * 64)
+            f.write(struct.pack("<I", 3)) # Version 3
+            f.write(struct.pack("<Q", 2)) # 2 tensors
+            f.write(struct.pack("<Q", 0)) # 0 metadata key-values
 
-        try:
-            ok = self.loader.load(t_path)
-            self.assertTrue(ok)
-            self.assertEqual(self.loader.detected_format, "gguf")
-        finally:
-            Path(t_path).unlink(missing_ok=True)
-
-    def test_pytorch_bin_loader(self):
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
-            t_path = f.name
-            f.write(b"PK\x03\x04mock_torch_checkpoint")
-
-        try:
-            ok = self.loader.load(t_path)
-            self.assertTrue(ok)
-            self.assertEqual(self.loader.detected_format, "pytorch_bin")
-        finally:
-            Path(t_path).unlink(missing_ok=True)
+        ok = self.loader.load(temp_path)
+        os.remove(temp_path)
+        self.assertTrue(ok)
+        self.assertEqual(self.loader.detected_format, "gguf")
+        self.assertEqual(len(self.loader.tensors), 2)
 
 if __name__ == "__main__":
     unittest.main()

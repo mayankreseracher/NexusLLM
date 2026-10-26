@@ -1,4 +1,5 @@
 import ctypes
+import ctypes.util
 import os
 import sys
 import platform
@@ -66,18 +67,36 @@ class NexusNativeEngine:
         self._engine_handle = None
 
         if dll_path is None:
-            # Search candidate paths
-            base_dir = Path(__file__).resolve().parent.parent.parent
-            candidates = [
-                base_dir / "nexus_engine.dll",
-                base_dir / "build" / "nexus_engine.dll",
-                base_dir / "libnexus_engine.so",
-                base_dir / "libnexus_engine.dylib"
+            # Search candidate paths across repository root, package dir, build dirs, and CWD
+            pkg_dir = Path(__file__).resolve().parent
+            repo_dir = pkg_dir.parent.parent
+            cwd = Path.cwd()
+
+            names = ["nexus_engine.dll", "libnexus_engine.so", "libnexus_engine.dylib"]
+            search_dirs = [
+                repo_dir,
+                repo_dir / "build",
+                repo_dir / "build" / "Release",
+                repo_dir / "build" / "Debug",
+                pkg_dir,
+                cwd,
+                cwd / "build",
+                cwd / "build" / "Release",
             ]
-            for c in candidates:
-                if c.exists():
-                    dll_path = str(c)
+
+            for d in search_dirs:
+                for name in names:
+                    candidate = d / name
+                    if candidate.exists():
+                        dll_path = str(candidate)
+                        break
+                if dll_path:
                     break
+
+            if dll_path is None:
+                found = ctypes.util.find_library("nexus_engine")
+                if found:
+                    dll_path = found
 
         if dll_path and os.path.exists(dll_path):
             try:

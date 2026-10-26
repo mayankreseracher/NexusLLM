@@ -7,10 +7,21 @@ prefix caching efficiency, and tiered memory allocation on the local host.
 import time
 import statistics
 from typing import Dict, Any, List
-from .bindings import NexusNativeEngine
-from .memory_manager import DynamicMemoryTierManager
-from .prefix_cache import RadixPrefixCache
-from .continuous_batcher import ContinuousBatchEngine
+try:
+    from .bindings import NexusNativeEngine
+    from .memory_manager import DynamicMemoryTierManager
+    from .prefix_cache import RadixPrefixCache
+    from .continuous_batcher import ContinuousBatchEngine
+except (ImportError, ValueError):
+    import sys
+    from pathlib import Path
+    pkg_root = Path(__file__).resolve().parent.parent
+    if str(pkg_root) not in sys.path:
+        sys.path.insert(0, str(pkg_root))
+    from nexus_llm.bindings import NexusNativeEngine
+    from nexus_llm.memory_manager import DynamicMemoryTierManager
+    from nexus_llm.prefix_cache import RadixPrefixCache
+    from nexus_llm.continuous_batcher import ContinuousBatchEngine
 
 def run_benchmark(concurrency: int = 16, prompt_len: int = 128, gen_len: int = 64) -> Dict[str, Any]:
     print("=====================================================================")
