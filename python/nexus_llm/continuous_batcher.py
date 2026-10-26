@@ -7,7 +7,10 @@ import time
 import uuid
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 @dataclass
 class BatchRequest:

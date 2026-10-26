@@ -74,6 +74,59 @@ void TransformerEngine::initialize_default_weights() {
         for (auto& w : default_layer_data_[l]) w = dist(rng);
     }
 
+    // Register parameters into MemoryTierManager (Tier 1 Host System RAM)
+    // so they are tracked, tiered, prefetched, and activated through Tier 0 working buffers
+    if (tier_mgr_) {
+        TensorShape emb_shape;
+        emb_shape.dims = { vocab_size_, hidden_size_ };
+        tier_mgr_->register_parameter("token_embd.weight", DataType::FP32, emb_shape, default_embed_table_.data());
+
+        TensorShape head_shape;
+        head_shape.dims = { vocab_size_, hidden_size_ };
+        tier_mgr_->register_parameter("output.weight", DataType::FP32, head_shape, default_lm_head_.data());
+
+        for (size_t l = 0; l < num_layers_; ++l) {
+            std::string pfx = "blk." + std::to_string(l) + ".";
+            const float* lw = default_layer_data_[l].data();
+            size_t off = 0;
+
+            TensorShape norm_shape; norm_shape.dims = { hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "attn_norm.weight", DataType::FP32, norm_shape, lw + off);
+            off += hidden_size_;
+
+            TensorShape q_shape; q_shape.dims = { num_heads_ * head_dim_, hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "attn_q.weight", DataType::FP32, q_shape, lw + off);
+            off += (hidden_size_ * hidden_size_);
+
+            TensorShape k_shape; k_shape.dims = { num_kv_heads_ * head_dim_, hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "attn_k.weight", DataType::FP32, k_shape, lw + off);
+            off += (num_kv_heads_ * head_dim_ * hidden_size_);
+
+            TensorShape v_shape; v_shape.dims = { num_kv_heads_ * head_dim_, hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "attn_v.weight", DataType::FP32, v_shape, lw + off);
+            off += (num_kv_heads_ * head_dim_ * hidden_size_);
+
+            TensorShape o_shape; o_shape.dims = { hidden_size_, hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "attn_output.weight", DataType::FP32, o_shape, lw + off);
+            off += (hidden_size_ * hidden_size_);
+
+            TensorShape ffn_norm_shape; ffn_norm_shape.dims = { hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "ffn_norm.weight", DataType::FP32, ffn_norm_shape, lw + off);
+            off += hidden_size_;
+
+            TensorShape gate_shape; gate_shape.dims = { intermediate_size_, hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "ffn_gate.weight", DataType::FP32, gate_shape, lw + off);
+            off += (intermediate_size_ * hidden_size_);
+
+            TensorShape up_shape; up_shape.dims = { intermediate_size_, hidden_size_ };
+            tier_mgr_->register_parameter(pfx + "ffn_up.weight", DataType::FP32, up_shape, lw + off);
+            off += (intermediate_size_ * hidden_size_);
+
+            TensorShape down_shape; down_shape.dims = { hidden_size_, intermediate_size_ };
+            tier_mgr_->register_parameter(pfx + "ffn_down.weight", DataType::FP32, down_shape, lw + off);
+        }
+    }
+
     weights_ready_ = true;
 }
 

@@ -148,10 +148,6 @@ void* MemoryTierManager::activate_parameter(const std::string& name) {
 
         std::lock_guard<std::mutex> sl(stats_mutex_);
         stats_.prefetch_hits++;
-        stats_.tier0_allocated_bytes += tv->byte_size;
-        if (stats_.tier1_inactive_bytes >= tv->byte_size) {
-            stats_.tier1_inactive_bytes -= tv->byte_size;
-        }
         stats_.pcie_bandwidth_gbps = platform_profile_.theoretical_bandwidth_gbps;
         return tv->active_ptr;
     }
@@ -177,10 +173,6 @@ void* MemoryTierManager::activate_parameter(const std::string& name) {
         if (copy_time_s > 0.0) {
             double cur_gbps = (tv->byte_size / (1024.0 * 1024.0 * 1024.0)) / copy_time_s;
             stats_.pcie_bandwidth_gbps = (stats_.pcie_bandwidth_gbps * 0.9) + (cur_gbps * 0.1);
-        }
-        stats_.tier0_allocated_bytes += tv->byte_size;
-        if (stats_.tier1_inactive_bytes >= tv->byte_size) {
-            stats_.tier1_inactive_bytes -= tv->byte_size;
         }
     }
 
@@ -244,18 +236,34 @@ NexusStatus MemoryTierManager::deactivate_parameter(const std::string& name) {
 
 WorkingBufferSlot* MemoryTierManager::acquire_active_slot(size_t required_bytes) {
     // Acquire slot in round-robin ping-pong fashion
-    for (size_t attempt = 0; attempt < NUM_WORKING_SLOTS * 2; ++attempt) {
+    for (size_t attempt = 0; attempt < NUM_WORKING_SLOTS; ++attempt) {
         size_t idx = current_slot_idx_ % NUM_WORKING_SLOTS;
         current_slot_idx_++;
 
-        if (!working_slots_[idx].in_use.load()) {
-            if (working_slots_[idx].capacity_bytes >= required_bytes) {
-                working_slots_[idx].in_use.store(true);
-                working_slots_[idx].used_bytes = required_bytes;
-                return &working_slots_[idx];
-            }
+        if (!working_slots_[idx].in_use.load() && working_slots_[idx].capacity_bytes >= required_bytes) {
+            working_slots_[idx].in_use.store(true);
+            working_slots_[idx].used_bytes = required_bytes;
+            return &working_slots_[idx];
         }
     }
+
+    // Ping-pong double-buffering rotation: recycle next slot
+    size_t idx = current_slot_idx_ % NUM_WORKING_SLOTS;
+    current_slot_idx_++;
+    if (working_slots_[idx].capacity_bytes >= required_bytes) {
+        if (!working_slots_[idx].current_layer_id.empty()) {
+            auto it = registry_.find(working_slots_[idx].current_layer_id);
+            if (it != registry_.end()) {
+                it->second->is_active = false;
+                it->second->active_ptr = nullptr;
+                it->second->current_tier = MemoryTier::TIER1_HOST_SYSTEM_RAM;
+            }
+        }
+        working_slots_[idx].in_use.store(true);
+        working_slots_[idx].used_bytes = required_bytes;
+        return &working_slots_[idx];
+    }
+
     return nullptr;
 }
 
@@ -289,7 +297,20 @@ void MemoryTierManager::prefetch_worker_loop() {
 
 TierMemoryStats MemoryTierManager::get_stats() const {
     std::lock_guard<std::mutex> sl(stats_mutex_);
-    return stats_;
+    TierMemoryStats s = stats_;
+    size_t active_bytes = 0;
+    for (size_t i = 0; i < NUM_WORKING_SLOTS; ++i) {
+        if (working_slots_[i].in_use.load()) {
+            active_bytes += working_slots_[i].used_bytes;
+        }
+    }
+    s.tier0_allocated_bytes = active_bytes;
+    if (tier1_offset_ >= active_bytes) {
+        s.tier1_inactive_bytes = tier1_offset_ - active_bytes;
+    } else {
+        s.tier1_inactive_bytes = tier1_offset_;
+    }
+    return s;
 }
 
 TensorView* MemoryTierManager::get_tensor_view(const std::string& name) {

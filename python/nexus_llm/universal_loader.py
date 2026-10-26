@@ -12,7 +12,10 @@ import json
 import struct
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 class UniversalModelLoader:
     def __init__(self, memory_tier_manager=None):
@@ -165,7 +168,7 @@ class UniversalModelLoader:
             self.memory_mgr.register_tensor(tinfo["name"], tinfo)
         return True
 
-    def get_tensor_data(self, name: str) -> Optional[np.ndarray]:
+    def get_tensor_data(self, name: str) -> Optional[Any]:
         tinfo = self.tensors.get(name)
         if not tinfo:
             return None

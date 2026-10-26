@@ -7,7 +7,10 @@ Keeps inactive parameters in Host System RAM while the active working set
 import time
 import threading
 from typing import Dict, Any, Optional, Set
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 class DynamicMemoryTierManager:
     def __init__(self, tier0_capacity_mb: int = 1024, tier1_capacity_mb: int = 16384):
@@ -45,7 +48,7 @@ class DynamicMemoryTierManager:
             }
             self.tier1_inactive_bytes += byte_size
 
-    def activate_tensor(self, name: str) -> Optional[np.ndarray]:
+    def activate_tensor(self, name: str) -> Optional[Any]:
         """Brings tensor from Host RAM into Tier 0 Active working set."""
         with self._lock:
             t = self.tensors.get(name)

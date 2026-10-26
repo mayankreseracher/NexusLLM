@@ -3,12 +3,34 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <string>
 
 int main(int argc, char** argv) {
     std::cout << "================================================================" << std::endl;
     std::cout << "   NEXUS-LLM HIGH-THROUGHPUT TIERED INFERENCE ENGINE BENCHMARK  " << std::endl;
     std::cout << "   Active Accelerator + Inactive Host RAM Dynamic Offloader     " << std::endl;
     std::cout << "================================================================" << std::endl;
+
+    std::string model_path = "";
+    size_t num_requests = 16;
+    size_t prompt_len = 128;
+    size_t gen_len = 64;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--model" && i + 1 < argc) {
+            model_path = argv[++i];
+        } else if (arg == "--requests" && i + 1 < argc) {
+            num_requests = std::stoull(argv[++i]);
+        } else if (arg == "--prompt" && i + 1 < argc) {
+            prompt_len = std::stoull(argv[++i]);
+        } else if (arg == "--gen" && i + 1 < argc) {
+            gen_len = std::stoull(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [--model <path.gguf>] [--requests <N>] [--prompt <len>] [--gen <len>]" << std::endl;
+            return 0;
+        }
+    }
 
     // 512 MB Tier 0 (working buffer), 4 GB Tier 1 (Host System RAM), 4096 KV blocks
     size_t tier0_bytes = 512ULL * 1024 * 1024;
@@ -34,23 +56,50 @@ int main(int argc, char** argv) {
     std::cout << "[Platform HW]  Theoretical Peak BW    : " << pinfo.theoretical_bandwidth_gbps << " GB/s" << std::endl;
     std::cout << "[Platform HW]  Performance Profile    : " << pinfo.performance_tier_desc << std::endl;
     std::cout << "----------------------------------------------------------------" << std::endl;
-    std::cout << "[Nexus Engine] Tier 0 (Active Working Set): " << (tier0_bytes / (1024 * 1024)) << " MB" << std::endl;
-    std::cout << "[Nexus Engine] Tier 1 (Host RAM Residency): " << (tier1_bytes / (1024 * 1024)) << " MB" << std::endl;
 
-    // Submit a burst of concurrent requests to test continuous batching
-    const size_t NUM_REQUESTS = 16;
-    const size_t PROMPT_LEN = 128;
-    const size_t GEN_LEN = 64;
-
-    std::vector<int32_t> sample_prompt(PROMPT_LEN);
-    for (size_t i = 0; i < PROMPT_LEN; ++i) {
-        sample_prompt[i] = static_cast<int32_t>(100 + (i % 500));
+    if (!model_path.empty()) {
+        std::cout << "[Model Loading] Loading model from: " << model_path << " ..." << std::endl;
+        int32_t status = nexus_load_model_auto(engine, model_path.c_str());
+        if (status != 0) {
+            std::cerr << "[Model Loading Error] Failed to load model file (Code: " << status << ")" << std::endl;
+            nexus_destroy_engine(engine);
+            return 1;
+        }
+        int32_t t_count = nexus_get_loaded_tensor_count(engine);
+        const char* arch = nexus_get_model_architecture(engine);
+        std::cout << "[Model Loading] Successfully loaded " << t_count << " parameters (" << arch << " arch) into Tier 1 Host RAM." << std::endl;
+    } else {
+        std::cout << "[Model Loading] Running on registered tiered model weights (Tier 1 Host RAM -> Tier 0 Active DMA)." << std::endl;
     }
 
-    std::cout << "\n[Benchmark] Submitting " << NUM_REQUESTS << " concurrent requests..." << std::endl;
-    for (size_t r = 0; r < NUM_REQUESTS; ++r) {
+    NexusLocalMemoryStats initial_stats;
+    nexus_get_memory_stats(engine, &initial_stats);
+    std::cout << "[Nexus Engine] Tier 0 (Active Working Set): " << (tier0_bytes / (1024 * 1024)) << " MB" << std::endl;
+    std::cout << "[Nexus Engine] Tier 1 (Host RAM Residency): " << (tier1_bytes / (1024 * 1024)) << " MB" << std::endl;
+    std::cout << "[Model Weights] Parameter Residency in Host RAM: " << (initial_stats.tier1_inactive_bytes / (1024 * 1024)) << " MB" << std::endl;
+
+    // Radix Prefix Cache Demonstration:
+    // Warm up the Radix tree with a common system prompt prefix (e.g. system instructions)
+    const size_t PREFIX_LEN = prompt_len / 2;
+    std::vector<int32_t> system_prefix(PREFIX_LEN);
+    for (size_t i = 0; i < PREFIX_LEN; ++i) {
+        system_prefix[i] = static_cast<int32_t>(100 + (i % 250));
+    }
+
+    std::cout << "\n[Prefix Cache] Priming Radix tree with " << PREFIX_LEN << "-token shared system prompt..." << std::endl;
+    nexus_submit_request(engine, "req-prime-prefix", system_prefix.data(), PREFIX_LEN, 1);
+    int32_t prime_out = 0;
+    nexus_step_continuous_batch(engine, nullptr, &prime_out, 1);
+
+    // Submit batch of requests that share the common system prompt prefix
+    std::cout << "[Benchmark] Submitting " << num_requests << " concurrent requests sharing prefix..." << std::endl;
+    for (size_t r = 0; r < num_requests; ++r) {
+        std::vector<int32_t> full_prompt = system_prefix;
+        for (size_t i = PREFIX_LEN; i < prompt_len; ++i) {
+            full_prompt.push_back(static_cast<int32_t>(300 + (r * 13 + i) % 500));
+        }
         std::string req_id = "req-" + std::to_string(r);
-        nexus_submit_request(engine, req_id.c_str(), sample_prompt.data(), PROMPT_LEN, GEN_LEN);
+        nexus_submit_request(engine, req_id.c_str(), full_prompt.data(), full_prompt.size(), gen_len);
     }
 
     // Run continuous batching decode loop
@@ -58,17 +107,17 @@ int main(int argc, char** argv) {
     auto t_start = std::chrono::high_resolution_clock::now();
 
     size_t total_tokens = 0;
-    std::vector<int32_t> out_tokens(NUM_REQUESTS);
+    std::vector<int32_t> out_tokens(num_requests);
 
-    for (size_t step = 0; step < GEN_LEN + 10; ++step) {
-        int32_t stepped = nexus_step_continuous_batch(engine, nullptr, out_tokens.data(), NUM_REQUESTS);
+    for (size_t step = 0; step < gen_len + 10; ++step) {
+        int32_t stepped = nexus_step_continuous_batch(engine, nullptr, out_tokens.data(), num_requests);
         total_tokens += stepped;
         if (stepped == 0 && step > 5) break; // Finished all
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();
-    double tps = total_tokens / elapsed_sec;
+    double tps = total_tokens / (elapsed_sec > 0.0 ? elapsed_sec : 1e-6);
 
     NexusLocalMemoryStats stats;
     nexus_get_memory_stats(engine, &stats);

@@ -43,6 +43,14 @@ void DisaggregatedControlPlane::submit_request(std::shared_ptr<InferenceRequest>
     req->processed_tokens = matched_tokens;
     req->assigned_block_ids = matched_blocks;
 
+    // Allocate any additional blocks needed for the remaining uncached prompt tokens
+    size_t total_blocks_needed = (req->prompt_tokens.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (req->assigned_block_ids.size() < total_blocks_needed) {
+        size_t extra_needed = total_blocks_needed - req->assigned_block_ids.size();
+        auto extra_blocks = kv_mgr_->allocate_blocks(extra_needed);
+        req->assigned_block_ids.insert(req->assigned_block_ids.end(), extra_blocks.begin(), extra_blocks.end());
+    }
+
     if (req->processed_tokens >= req->prompt_tokens.size()) {
         // Entire prompt was cached! Skip prefill, immediately enter decode
         req->phase = TaskPhase::DECODE;

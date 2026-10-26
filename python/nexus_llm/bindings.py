@@ -6,7 +6,6 @@ import platform
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
-import numpy as np
 
 class NexusMemoryStatsStruct(ctypes.Structure):
     _fields_ = [
