@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <functional>
 #include <cstring>
+#include <cstdlib>
+#include <new>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -67,6 +69,30 @@
 
 // Cache line and SIMD alignment
 constexpr size_t NEXUS_ALIGNMENT = 64; 
+
+inline void* nexus_aligned_alloc(size_t alignment, size_t size) {
+    size_t sz = (size + alignment - 1) & ~(alignment - 1);
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    return VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(NEXUS_PLATFORM_POSIX)
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, sz) == 0) {
+        return ptr;
+    }
+    return nullptr;
+#else
+    return std::malloc(sz);
+#endif
+}
+
+inline void nexus_aligned_free(void* ptr) {
+    if (!ptr) return;
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+    std::free(ptr);
+#endif
+} 
 
 namespace nexus {
 

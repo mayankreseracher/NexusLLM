@@ -55,6 +55,9 @@ endif()
 # Standalone benchmark executable
 add_executable(nexus_bench src/main_bench.cpp)
 target_link_libraries(nexus_bench PRIVATE nexus_engine)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(nexus_bench PRIVATE dl pthread)
+endif()
 
 if(APPLE)
     set_target_properties(nexus_bench PROPERTIES

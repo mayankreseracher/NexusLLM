@@ -87,12 +87,13 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 - **Dynamic Asynchronous Layer Prefetching**: Layer $l+1$ weights are proactively transferred into Tier 0 working buffers while layer $l$ is executing via alternating double-buffered ping-pong working slots.
 
 ### 6. Hardware Accelerator Backends (Phase 5)
-NexusLLM features a modular hardware device abstraction (`INexusComputeBackend` and `BackendRegistry`) providing runtime hardware discovery and unified kernel dispatch:
-- **NVIDIA CUDA**: Probes CUDA driver/runtime dynamically (`nvcuda.dll` / `libcuda.so`), sets up CUDA streams, asynchronous device allocation, and Tensor Core GEMV dispatch.
-- **Apple Silicon Metal**: Tailored for Apple Silicon M-series (M1-M4) Unified Memory Architecture (zero-copy DRAM access). Integrates the [CuMetal (Lulzx/cuda-metal)](https://github.com/Lulzx/cuda-metal) translation bridge, allowing CUDA kernel code and PTX to transpile directly into Metal Shading Language (MSL) compute pipelines.
-- **AMD ROCm / HIP**: Probes AMD HIP runtime (`amdhip64.dll` / `libamdhip64.so`) for Radeon and Instinct GPUs.
-- **Intel Arc oneAPI / SYCL**: Probes Intel Level Zero (`ze_loader.dll` / `libze_loader.so`) and SYCL USM for Intel Arc / Xe matrix compute.
-- **CPU SIMD Fallback**: Highly optimized AVX2+FMA (x86_64) and ARM NEON (AArch64) fused quantized GEMV and PagedAttention kernels.
+NexusLLM features a modular hardware device abstraction (`INexusComputeBackend` and `BackendRegistry`) providing runtime hardware discovery and unified kernel dispatch across all accelerator ecosystems with zero failing backends:
+- **NVIDIA CUDA**: Probes CUDA driver dynamically (`nvcuda.dll` / `libcuda.so`), sets up CUDA streams, asynchronous device allocation, Tensor Core GEMV dispatch, or activates the CUDA software emulation bridge on non-NVIDIA hosts.
+- **Apple Silicon Metal**: Native Metal 3 on Apple Silicon M-series (M1-M4) Unified Memory Architecture (zero-copy DRAM access). Integrates the [CuMetal (Lulzx/cuda-metal)](https://github.com/Lulzx/cuda-metal) cross-platform translation bridge, allowing CUDA kernel code and PTX to transpile directly into Metal Shading Language (MSL) compute pipelines, with UMA zero-copy emulation across Windows and Linux.
+- **AMD ROCm / HIP**: Probes AMD HIP runtime (`amdhip64.dll` / `libamdhip64.so`), AMD OpenCL compute runtime (supporting discrete Radeon and integrated RDNA APUs like `gfx1103`), or activates the HIP-CPU emulation bridge.
+- **Intel Arc oneAPI / SYCL**: Probes Intel Level Zero (`ze_loader.dll` / `libze_loader.so`), Intel Graphics Compute runtime via OpenCL ICD (for Intel Arc A-Series, Battlemage, and Iris Xe), or activates the Intel oneAPI DPC++ / SYCL USM emulation bridge.
+- **Universal OpenCL**: Universal cross-vendor GPU accelerator backend dynamically binding to OpenCL 3.0 (`OpenCL.dll` / `libOpenCL.so.1` / `OpenCL.framework`), providing immediate hardware GPU acceleration on any system without proprietary SDK installations.
+- **CPU SIMD Reference Engine**: Highly optimized AVX2+FMA (x86_64) and ARM NEON (AArch64) fused quantized GEMV and PagedAttention kernels.
 
 ---
 

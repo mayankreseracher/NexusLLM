@@ -50,9 +50,17 @@ public:
 
     const ModelMetadata& get_metadata() const { return metadata_; }
 
+    void set_compute_backend(std::shared_ptr<class INexusComputeBackend> backend) {
+        backend_ = backend;
+    }
+    std::shared_ptr<class INexusComputeBackend> get_compute_backend() const {
+        return backend_;
+    }
+
 private:
     std::shared_ptr<MemoryTierManager> tier_mgr_;
     std::shared_ptr<PagedKVCacheManager> kv_mgr_;
+    std::shared_ptr<class INexusComputeBackend> backend_;
     ModelMetadata metadata_;
 
     size_t hidden_size_ = 256;

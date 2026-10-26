@@ -74,7 +74,7 @@ class DynamicMemoryTierManager:
             t0 = time.perf_counter()
             # Allocate working buffer
             shape = t["info"].get("shape", [b_size // 4])
-            t["data_tier0"] = np.ones(shape, dtype=np.float32)
+            t["data_tier0"] = np.ones(shape, dtype=np.float32) if np is not None else b'\x00' * b_size
             t["is_active"] = True
             self.active_tensors.add(name)
 

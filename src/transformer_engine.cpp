@@ -1,4 +1,5 @@
 #include "transformer_engine.hpp"
+#include "nexus_backend.hpp"
 #include <iostream>
 #include <cmath>
 #include <random>
@@ -238,7 +239,11 @@ int32_t TransformerEngine::forward_token(
         const void* w_down = w_down_raw ? w_down_raw : (l_weights ? (l_weights + offset) : nullptr);
 
         // Pre-Attention RMSNorm
-        TransformerOps::rmsnorm(act_x_.data(), attn_norm, dt_attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        if (backend_) {
+            backend_->rmsnorm(act_x_.data(), attn_norm, dt_attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        } else {
+            TransformerOps::rmsnorm(act_x_.data(), attn_norm, dt_attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        }
 
         TensorView* tv_wq = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_q.weight") : nullptr;
         DataType dt_wq = tv_wq ? tv_wq->dtype : DataType::FP32;
@@ -262,9 +267,15 @@ int32_t TransformerEngine::forward_token(
         DataType dt_down = tv_down ? tv_down->dtype : DataType::FP32;
 
         // Compute Q, K, V projections via matrix-vector multiplication (supporting FP32, FP16, Q4_0, Q8_0)
-        TransformerOps::matmul_vec_dispatch(wq, dt_wq, act_norm_.data(), act_q_.data(), num_heads_ * head_dim_, hidden_size_);
-        TransformerOps::matmul_vec_dispatch(wk, dt_wk, act_norm_.data(), act_k_.data(), num_kv_heads_ * head_dim_, hidden_size_);
-        TransformerOps::matmul_vec_dispatch(wv, dt_wv, act_norm_.data(), act_v_.data(), num_kv_heads_ * head_dim_, hidden_size_);
+        if (backend_) {
+            backend_->gemv_dispatch(wq, dt_wq, act_norm_.data(), act_q_.data(), num_heads_ * head_dim_, hidden_size_);
+            backend_->gemv_dispatch(wk, dt_wk, act_norm_.data(), act_k_.data(), num_kv_heads_ * head_dim_, hidden_size_);
+            backend_->gemv_dispatch(wv, dt_wv, act_norm_.data(), act_v_.data(), num_kv_heads_ * head_dim_, hidden_size_);
+        } else {
+            TransformerOps::matmul_vec_dispatch(wq, dt_wq, act_norm_.data(), act_q_.data(), num_heads_ * head_dim_, hidden_size_);
+            TransformerOps::matmul_vec_dispatch(wk, dt_wk, act_norm_.data(), act_k_.data(), num_kv_heads_ * head_dim_, hidden_size_);
+            TransformerOps::matmul_vec_dispatch(wv, dt_wv, act_norm_.data(), act_v_.data(), num_kv_heads_ * head_dim_, hidden_size_);
+        }
 
         // Apply Rotary Position Embeddings (RoPE)
         TransformerOps::rope(act_q_.data(), act_k_.data(), head_dim_, num_heads_, num_kv_heads_, position, metadata_.rope_theta);
@@ -290,32 +301,61 @@ int32_t TransformerEngine::forward_token(
         }
 
         // PagedAttention Multi-Head / Grouped-Query Decode
-        TransformerOps::paged_attention_decode(
-            act_q_.data(),
-            block_table,
-            *kv_mgr_,
-            l,
-            position,
-            num_heads_,
-            num_kv_heads_,
-            head_dim_,
-            act_attn_out_.data()
-        );
+        if (backend_) {
+            backend_->paged_attention_decode(
+                act_q_.data(),
+                block_table,
+                *kv_mgr_,
+                l,
+                position,
+                num_heads_,
+                num_kv_heads_,
+                head_dim_,
+                act_attn_out_.data()
+            );
+        } else {
+            TransformerOps::paged_attention_decode(
+                act_q_.data(),
+                block_table,
+                *kv_mgr_,
+                l,
+                position,
+                num_heads_,
+                num_kv_heads_,
+                head_dim_,
+                act_attn_out_.data()
+            );
+        }
 
         // Attention output projection and residual accumulation
-        TransformerOps::matmul_vec_dispatch(wo, dt_wo, act_attn_out_.data(), act_attn_proj_.data(), hidden_size_, hidden_size_);
+        if (backend_) {
+            backend_->gemv_dispatch(wo, dt_wo, act_attn_out_.data(), act_attn_proj_.data(), hidden_size_, hidden_size_);
+        } else {
+            TransformerOps::matmul_vec_dispatch(wo, dt_wo, act_attn_out_.data(), act_attn_proj_.data(), hidden_size_, hidden_size_);
+        }
         for (size_t i = 0; i < hidden_size_; ++i) {
             act_x_[i] += act_attn_proj_[i];
         }
 
         // Post-Attention RMSNorm
-        TransformerOps::rmsnorm(act_x_.data(), ffn_norm, dt_ffn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        if (backend_) {
+            backend_->rmsnorm(act_x_.data(), ffn_norm, dt_ffn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        } else {
+            TransformerOps::rmsnorm(act_x_.data(), ffn_norm, dt_ffn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        }
 
         // SwiGLU Feed-Forward Network: down(SiLU(gate(x)) * up(x))
-        TransformerOps::matmul_vec_dispatch(w_gate, dt_gate, act_norm_.data(), act_gate_.data(), intermediate_size_, hidden_size_);
-        TransformerOps::matmul_vec_dispatch(w_up, dt_up, act_norm_.data(), act_up_.data(), intermediate_size_, hidden_size_);
-        TransformerOps::swiglu(act_gate_.data(), act_up_.data(), act_swiglu_.data(), intermediate_size_);
-        TransformerOps::matmul_vec_dispatch(w_down, dt_down, act_swiglu_.data(), act_down_.data(), hidden_size_, intermediate_size_);
+        if (backend_) {
+            backend_->gemv_dispatch(w_gate, dt_gate, act_norm_.data(), act_gate_.data(), intermediate_size_, hidden_size_);
+            backend_->gemv_dispatch(w_up, dt_up, act_norm_.data(), act_up_.data(), intermediate_size_, hidden_size_);
+            backend_->swiglu(act_gate_.data(), act_up_.data(), act_swiglu_.data(), intermediate_size_);
+            backend_->gemv_dispatch(w_down, dt_down, act_swiglu_.data(), act_down_.data(), hidden_size_, intermediate_size_);
+        } else {
+            TransformerOps::matmul_vec_dispatch(w_gate, dt_gate, act_norm_.data(), act_gate_.data(), intermediate_size_, hidden_size_);
+            TransformerOps::matmul_vec_dispatch(w_up, dt_up, act_norm_.data(), act_up_.data(), intermediate_size_, hidden_size_);
+            TransformerOps::swiglu(act_gate_.data(), act_up_.data(), act_swiglu_.data(), intermediate_size_);
+            TransformerOps::matmul_vec_dispatch(w_down, dt_down, act_swiglu_.data(), act_down_.data(), hidden_size_, intermediate_size_);
+        }
 
         // Residual accumulation
         for (size_t i = 0; i < hidden_size_; ++i) {
@@ -332,14 +372,22 @@ int32_t TransformerEngine::forward_token(
     void* out_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output_norm.weight") : nullptr;
     TensorView* tv_out_norm = tier_mgr_ ? tier_mgr_->get_tensor_view("output_norm.weight") : nullptr;
     DataType dt_out_norm = tv_out_norm ? tv_out_norm->dtype : DataType::FP32;
-    TransformerOps::rmsnorm(act_x_.data(), out_norm_raw, dt_out_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+    if (backend_) {
+        backend_->rmsnorm(act_x_.data(), out_norm_raw, dt_out_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+    } else {
+        TransformerOps::rmsnorm(act_x_.data(), out_norm_raw, dt_out_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+    }
 
     // 4. LM Head / Logits Projection
     void* head_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output.weight") : nullptr;
     const void* lm_head = head_raw ? head_raw : default_lm_head_.data();
     TensorView* tv_head = tier_mgr_ ? tier_mgr_->get_tensor_view("output.weight") : nullptr;
     DataType dt_head = tv_head ? tv_head->dtype : DataType::FP32;
-    TransformerOps::matmul_vec_dispatch(lm_head, dt_head, act_norm_.data(), act_logits_.data(), vocab_size_, hidden_size_);
+    if (backend_) {
+        backend_->gemv_dispatch(lm_head, dt_head, act_norm_.data(), act_logits_.data(), vocab_size_, hidden_size_);
+    } else {
+        TransformerOps::matmul_vec_dispatch(lm_head, dt_head, act_norm_.data(), act_logits_.data(), vocab_size_, hidden_size_);
+    }
 
     // 5. Sampling: select actual next token
     int32_t next_token = TransformerOps::sample_logits(act_logits_.data(), vocab_size_, temperature);

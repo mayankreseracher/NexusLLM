@@ -21,8 +21,11 @@ public:
         loader = std::make_unique<nexus::UniversalModelLoader>(tier_mgr);
         kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(max_kv, 4, 4, 64);
         control_plane = std::make_unique<nexus::DisaggregatedControlPlane>(kv_mgr);
-        transformer = std::make_unique<nexus::TransformerEngine>(tier_mgr, kv_mgr, loader->get_metadata());
         backend = nexus::BackendRegistry::instance().create_default_backend();
+        transformer = std::make_unique<nexus::TransformerEngine>(tier_mgr, kv_mgr, loader->get_metadata());
+        if (transformer && backend) {
+            transformer->set_compute_backend(backend);
+        }
     }
 
     std::shared_ptr<nexus::MemoryTierManager> tier_mgr;
@@ -96,6 +99,9 @@ NEXUS_API int32_t nexus_set_compute_device(NexusEngineHandle engine, const char*
     auto* eng = static_cast<InternalEngine*>(engine);
     auto dev_type = nexus::BackendRegistry::parse_device_type(device_name);
     eng->backend = nexus::BackendRegistry::instance().create_backend(dev_type);
+    if (eng->transformer && eng->backend) {
+        eng->transformer->set_compute_backend(eng->backend);
+    }
     return 0;
 }
 

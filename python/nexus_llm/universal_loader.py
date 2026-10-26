@@ -174,4 +174,9 @@ class UniversalModelLoader:
             return None
         # Return synthetic or mmapped array
         shape = tinfo.get("shape", [1024])
-        return np.ones(shape, dtype=np.float16 if tinfo.get("dtype") == "FP16" else np.float32)
+        if np is not None:
+            return np.ones(shape, dtype=np.float16 if tinfo.get("dtype") == "FP16" else np.float32)
+        total_elems = 1
+        for s in shape:
+            total_elems *= s
+        return [1.0] * total_elems

@@ -26,16 +26,14 @@ MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_c
     if (tier0_raw_pool_ != MAP_FAILED && tier0_raw_pool_ != nullptr) {
         tier0_is_mmap_ = true;
     } else {
-        size_t sz = (tier0_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
-        tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz);
+        tier0_raw_pool_ = nexus_aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
         tier0_is_mmap_ = false;
     }
 
     if (tier1_raw_pool_ != MAP_FAILED && tier1_raw_pool_ != nullptr) {
         tier1_is_mmap_ = true;
     } else {
-        size_t sz = (tier1_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
-        tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz);
+        tier1_raw_pool_ = nexus_aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
         tier1_is_mmap_ = false;
     }
 
@@ -45,10 +43,8 @@ MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_c
 #endif
 
 #else
-    size_t sz0 = (tier0_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
-    size_t sz1 = (tier1_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
-    tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz0);
-    tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz1);
+    tier0_raw_pool_ = nexus_aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
+    tier1_raw_pool_ = nexus_aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
     tier0_is_mmap_ = false;
     tier1_is_mmap_ = false;
 #endif
@@ -82,15 +78,15 @@ MemoryTierManager::~MemoryTierManager() {
 #elif defined(NEXUS_PLATFORM_POSIX)
     if (tier0_raw_pool_ && tier0_raw_pool_ != MAP_FAILED) {
         if (tier0_is_mmap_) munmap(tier0_raw_pool_, tier0_capacity_);
-        else free(tier0_raw_pool_);
+        else nexus_aligned_free(tier0_raw_pool_);
     }
     if (tier1_raw_pool_ && tier1_raw_pool_ != MAP_FAILED) {
         if (tier1_is_mmap_) munmap(tier1_raw_pool_, tier1_capacity_);
-        else free(tier1_raw_pool_);
+        else nexus_aligned_free(tier1_raw_pool_);
     }
 #else
-    if (tier0_raw_pool_) free(tier0_raw_pool_);
-    if (tier1_raw_pool_) free(tier1_raw_pool_);
+    if (tier0_raw_pool_) nexus_aligned_free(tier0_raw_pool_);
+    if (tier1_raw_pool_) nexus_aligned_free(tier1_raw_pool_);
 #endif
 }
 

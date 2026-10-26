@@ -96,6 +96,12 @@ class TestHardwareBackends(unittest.TestCase):
         active_name = self.lib.nexus_get_active_device_name(engine).decode("utf-8")
         self.assertTrue("Intel" in active_name or "Arc" in active_name or "Level Zero" in active_name)
 
+        # Switch to Universal OpenCL
+        ret = self.lib.nexus_set_compute_device(engine, b"opencl")
+        self.assertEqual(ret, 0)
+        active_name = self.lib.nexus_get_active_device_name(engine).decode("utf-8")
+        self.assertTrue("OpenCL" in active_name)
+
         # Test Phase 4 Layer Prefetch & Deactivation
         p_ret = self.lib.nexus_prefetch_layer_index(engine, 1)
         self.assertEqual(p_ret, 0)

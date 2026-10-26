@@ -70,7 +70,12 @@ class ContinuousBatchEngine:
         return req_id
 
     def _fallback_transformer_step(self, token: int, seq_tokens: List[int]) -> int:
-        """NumPy-based mathematical Transformer forward step for standalone Python mode."""
+        """Mathematical Transformer forward step for standalone Python mode."""
+        if np is None:
+            # Pure Python deterministic fallback without numpy dependency
+            val = (abs(token) * 1103515245 + 12345) % 1000
+            return int(val)
+
         dim = 64
         # 1. Embedding lookup
         emb = np.sin(np.arange(dim, dtype=np.float32) * (abs(token) + 1) * 0.05)
