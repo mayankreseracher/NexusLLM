@@ -56,6 +56,9 @@ public:
     // Local buffer residency statistics (strictly offline / zero-telemetry)
     TierMemoryStats get_stats() const;
 
+    // Platform hardware and raw performance profile
+    const PlatformHardwareProfile& get_platform_profile() const { return platform_profile_; }
+
     // Direct access to a tensor view
     TensorView* get_tensor_view(const std::string& name);
     const std::unordered_map<std::string, std::shared_ptr<TensorView>>& get_all_tensors() const {
@@ -65,6 +68,7 @@ public:
 private:
     void prefetch_worker_loop();
 
+    PlatformHardwareProfile platform_profile_;
     size_t tier0_capacity_;
     size_t tier1_capacity_;
     

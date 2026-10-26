@@ -39,6 +39,25 @@ NEXUS_API void nexus_destroy_engine(NexusEngineHandle engine) {
     }
 }
 
+NEXUS_API void nexus_get_platform_info(NexusPlatformInfo* out_info) {
+    if (!out_info) return;
+    auto profile = nexus::PlatformHardwareProfile::detect();
+    out_info->os_type = static_cast<uint32_t>(profile.os);
+    std::strncpy(out_info->os_name, profile.os_name.c_str(), sizeof(out_info->os_name) - 1);
+    out_info->os_name[sizeof(out_info->os_name) - 1] = '\0';
+    std::strncpy(out_info->cpu_arch, profile.cpu_arch.c_str(), sizeof(out_info->cpu_arch) - 1);
+    out_info->cpu_arch[sizeof(out_info->cpu_arch) - 1] = '\0';
+    out_info->vector_isa = static_cast<uint32_t>(profile.vector_isa);
+    std::strncpy(out_info->vector_isa_name, profile.vector_isa_name.c_str(), sizeof(out_info->vector_isa_name) - 1);
+    out_info->vector_isa_name[sizeof(out_info->vector_isa_name) - 1] = '\0';
+    out_info->is_unified_memory = profile.is_unified_memory ? 1 : 0;
+    out_info->has_transparent_hugepages = profile.has_transparent_hugepages ? 1 : 0;
+    out_info->hardware_concurrency = profile.hardware_concurrency;
+    out_info->theoretical_bandwidth_gbps = profile.theoretical_bandwidth_gbps;
+    std::strncpy(out_info->performance_tier_desc, profile.performance_tier_description.c_str(), sizeof(out_info->performance_tier_desc) - 1);
+    out_info->performance_tier_desc[sizeof(out_info->performance_tier_desc) - 1] = '\0';
+}
+
 NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* filepath) {
     if (!engine || !filepath) return -1;
     auto* eng = static_cast<InternalEngine*>(engine);

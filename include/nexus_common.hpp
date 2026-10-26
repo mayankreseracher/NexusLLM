@@ -12,23 +12,201 @@
 #include <functional>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <thread>
 
+// ============================================================================
+// OS & Platform Identification
+// ============================================================================
 #if defined(_WIN32) || defined(_WIN64)
     #define NEXUS_PLATFORM_WINDOWS 1
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
     #endif
     #include <windows.h>
+#elif defined(__APPLE__) && defined(__MACH__)
+    #define NEXUS_PLATFORM_MACOS 1
+    #define NEXUS_PLATFORM_POSIX 1
+    #include <sys/mman.h>
+    #include <sys/types.h>
+    #include <sys/sysctl.h>
+    #include <unistd.h>
+    #include <mach/mach.h>
+#elif defined(__linux__)
+    #define NEXUS_PLATFORM_LINUX 1
+    #define NEXUS_PLATFORM_POSIX 1
+    #include <sys/mman.h>
+    #include <sys/types.h>
+    #include <unistd.h>
+    #include <sched.h>
 #else
     #define NEXUS_PLATFORM_POSIX 1
     #include <sys/mman.h>
     #include <unistd.h>
 #endif
 
+// ============================================================================
+// CPU Architecture & Vector Engine Identification
+// ============================================================================
+#if defined(__aarch64__) || defined(_M_ARM64)
+    #define NEXUS_ARCH_AARCH64 1
+    #if defined(__ARM_NEON) || defined(__APPLE__) || defined(__linux__)
+        #define NEXUS_HAVE_ARM_NEON 1
+        #include <arm_neon.h>
+    #endif
+#elif defined(__x86_64__) || defined(_M_X64)
+    #define NEXUS_ARCH_X86_64 1
+    #if !defined(NEXUS_NO_AVX2)
+        #define NEXUS_HAVE_AVX2 1
+        #include <immintrin.h>
+    #endif
+#endif
+
 // Cache line and SIMD alignment
 constexpr size_t NEXUS_ALIGNMENT = 64; 
 
 namespace nexus {
+
+enum class OperatingSystem : uint32_t {
+    OS_WINDOWS = 0,
+    OS_MACOS_DARWIN = 1,
+    OS_LINUX_UBUNTU_DEBIAN = 2,
+    OS_LINUX_RHEL_CENTOS_ROCKY = 3,
+    OS_LINUX_FEDORA = 4,
+    OS_LINUX_ARCH = 5,
+    OS_LINUX_ALPINE = 6,
+    OS_LINUX_GENERIC = 7,
+    OS_OTHER_POSIX = 8
+};
+
+enum class HardwareVectorISA : uint32_t {
+    ISA_SCALAR_FALLBACK = 0,
+    ISA_ARM_NEON = 1,
+    ISA_AVX2_FMA = 2,
+    ISA_AVX512 = 3
+};
+
+struct PlatformHardwareProfile {
+    OperatingSystem os = OperatingSystem::OS_OTHER_POSIX;
+    std::string os_name = "Unknown POSIX";
+    std::string cpu_arch = "generic";
+    HardwareVectorISA vector_isa = HardwareVectorISA::ISA_SCALAR_FALLBACK;
+    std::string vector_isa_name = "Scalar";
+    
+    bool is_unified_memory = false;          // True on Apple Silicon (M1-M4) & APUs
+    bool has_transparent_hugepages = false;  // Linux THP (2MB/1GB pages)
+    bool has_posix_madvise = false;          // madvise support (WILLNEED, DONTNEED, HUGEPAGE)
+    bool has_memory_pinning = false;         // mlock / VirtualLock
+    uint32_t numa_nodes_count = 1;
+    uint32_t hardware_concurrency = 1;
+    double theoretical_bandwidth_gbps = 0.0;
+    std::string performance_tier_description;
+
+    static PlatformHardwareProfile detect() {
+        PlatformHardwareProfile profile;
+        profile.hardware_concurrency = std::thread::hardware_concurrency();
+        if (profile.hardware_concurrency == 0) profile.hardware_concurrency = 1;
+
+#if defined(NEXUS_PLATFORM_WINDOWS)
+        profile.os = OperatingSystem::OS_WINDOWS;
+        profile.os_name = "Microsoft Windows (NT Kernel)";
+        profile.has_memory_pinning = true;
+        profile.has_posix_madvise = false;
+        profile.has_transparent_hugepages = false;
+        profile.is_unified_memory = false;
+        profile.theoretical_bandwidth_gbps = 64.0; // Typical Dual/Quad Channel DDR5
+        profile.performance_tier_description = "Windows Tiered Host-VRAM Pipeline via VirtualAlloc & PCIe DMA";
+#elif defined(NEXUS_PLATFORM_MACOS)
+        profile.os = OperatingSystem::OS_MACOS_DARWIN;
+        profile.os_name = "Apple macOS Darwin";
+        profile.has_posix_madvise = true;
+        profile.has_memory_pinning = true;
+
+#if defined(NEXUS_ARCH_AARCH64)
+        profile.is_unified_memory = true; // Apple Silicon Unified Memory Architecture
+        profile.cpu_arch = "ARM64 (Apple Silicon M-Series)";
+        profile.vector_isa = HardwareVectorISA::ISA_ARM_NEON;
+        profile.vector_isa_name = "ARM NEON 128-bit + Apple AMX";
+        profile.theoretical_bandwidth_gbps = 410.0; // Base: 100-150 GB/s, Max: 410 GB/s, Ultra: 820 GB/s
+        profile.performance_tier_description = "Apple Silicon Zero-Copy UMA Tier (Shared DRAM bus, 0 PCIe latency)";
+#else
+        profile.is_unified_memory = false;
+        profile.cpu_arch = "x86_64 (Intel Mac)";
+        profile.vector_isa = HardwareVectorISA::ISA_AVX2_FMA;
+        profile.vector_isa_name = "AVX2 + FMA";
+        profile.theoretical_bandwidth_gbps = 50.0;
+        profile.performance_tier_description = "macOS Intel POSIX mmap Tier";
+#endif
+
+#elif defined(NEXUS_PLATFORM_LINUX)
+        profile.os = OperatingSystem::OS_LINUX_GENERIC;
+        profile.os_name = "Linux Generic (GNU/Linux)";
+        profile.has_posix_madvise = true;
+        profile.has_memory_pinning = true;
+
+        // Distro identification via /etc/os-release
+        std::ifstream os_release("/etc/os-release");
+        if (os_release.is_open()) {
+            std::string line;
+            while (std::getline(os_release, line)) {
+                if (line.rfind("ID=", 0) == 0) {
+                    std::string id = line.substr(3);
+                    if (!id.empty() && id.front() == '"') id = id.substr(1, id.size() - 2);
+                    if (id == "ubuntu" || id == "debian") {
+                        profile.os = OperatingSystem::OS_LINUX_UBUNTU_DEBIAN;
+                        profile.os_name = (id == "ubuntu") ? "Ubuntu Linux" : "Debian GNU/Linux";
+                    } else if (id == "rhel" || id == "centos" || id == "rocky" || id == "almalinux") {
+                        profile.os = OperatingSystem::OS_LINUX_RHEL_CENTOS_ROCKY;
+                        profile.os_name = "RHEL/Rocky/CentOS Enterprise Linux";
+                    } else if (id == "fedora") {
+                        profile.os = OperatingSystem::OS_LINUX_FEDORA;
+                        profile.os_name = "Fedora Linux";
+                    } else if (id == "arch" || id == "manjaro") {
+                        profile.os = OperatingSystem::OS_LINUX_ARCH;
+                        profile.os_name = "Arch Linux";
+                    } else if (id == "alpine") {
+                        profile.os = OperatingSystem::OS_LINUX_ALPINE;
+                        profile.os_name = "Alpine Linux (musl libc)";
+                    }
+                }
+            }
+        }
+
+        // Check Transparent Huge Pages (THP) support
+        std::ifstream thp_file("/sys/kernel/mm/transparent_hugepage/enabled");
+        if (thp_file.is_open()) {
+            profile.has_transparent_hugepages = true;
+        }
+
+        profile.is_unified_memory = false;
+        profile.theoretical_bandwidth_gbps = 85.0; // Server/Desktop high-speed DDR5 or PCIe Gen5
+        profile.performance_tier_description = "Linux Transparent Huge Pages (THP 2MB) + madvise(WILLNEED) Tier";
+#else
+        profile.os = OperatingSystem::OS_OTHER_POSIX;
+        profile.os_name = "Generic POSIX";
+        profile.has_posix_madvise = true;
+        profile.is_unified_memory = false;
+        profile.theoretical_bandwidth_gbps = 32.0;
+        profile.performance_tier_description = "Standard POSIX mmap Fallback Tier";
+#endif
+
+#if defined(NEXUS_ARCH_AARCH64) && !defined(NEXUS_PLATFORM_MACOS)
+        profile.cpu_arch = "ARM64 (aarch64)";
+        profile.vector_isa = HardwareVectorISA::ISA_ARM_NEON;
+        profile.vector_isa_name = "ARM NEON";
+#elif defined(NEXUS_ARCH_X86_64) && !defined(NEXUS_PLATFORM_MACOS)
+        profile.cpu_arch = "x86_64";
+        profile.vector_isa = HardwareVectorISA::ISA_AVX2_FMA;
+        profile.vector_isa_name = "AVX2 + FMA";
+#elif !defined(NEXUS_ARCH_AARCH64) && !defined(NEXUS_ARCH_X86_64)
+        profile.cpu_arch = "Unknown ISA";
+        profile.vector_isa = HardwareVectorISA::ISA_SCALAR_FALLBACK;
+        profile.vector_isa_name = "Scalar Fallback";
+#endif
+        return profile;
+    }
+};
 
 enum class DataType : uint32_t {
     FP32 = 0,

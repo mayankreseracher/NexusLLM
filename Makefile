@@ -1,16 +1,44 @@
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
 CXX ?= g++
-CXXFLAGS ?= -O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -mavx2 -mfma -pthread
+CXXFLAGS ?= -O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -pthread
+
+ifeq ($(UNAME_S),Darwin)
+    TARGET_LIB = libnexus_engine.dylib
+    LDFLAGS_SHARED = -dynamiclib
+    ifeq ($(UNAME_M),arm64)
+        SIMD_FLAGS = -march=armv8.5-a
+    else
+        SIMD_FLAGS = -mavx2 -mfma
+    endif
+    LDFLAGS_BENCH = -L. -lnexus_engine
+else
+    # Linux (Ubuntu, Debian, RHEL, CentOS, Rocky, Fedora, Arch, Alpine)
+    TARGET_LIB = libnexus_engine.so
+    LDFLAGS_SHARED = -shared -ldl
+    ifeq ($(UNAME_M),x86_64)
+        SIMD_FLAGS = -mavx2 -mfma
+    else ifneq ($(filter arm% aarch64%,$(UNAME_M)),)
+        SIMD_FLAGS = -march=armv8-a+simd
+    else
+        SIMD_FLAGS =
+    endif
+    LDFLAGS_BENCH = -L. -lnexus_engine -ldl
+endif
+
+CXXFLAGS += $(SIMD_FLAGS)
 
 SRC = src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/nexus_engine.cpp src/nexus_abi.cpp
 OBJ = $(SRC:.cpp=.o)
 
-all: libnexus_engine.so nexus_bench
+all: $(TARGET_LIB) nexus_bench
 
-libnexus_engine.so: $(SRC)
-	$(CXX) $(CXXFLAGS) -shared $(SRC) -o $@
+$(TARGET_LIB): $(SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS_SHARED) $(SRC) -o $@
 
-nexus_bench: src/main_bench.cpp libnexus_engine.so
-	$(CXX) $(CXXFLAGS) src/main_bench.cpp -L. -lnexus_engine -o $@
+nexus_bench: src/main_bench.cpp $(TARGET_LIB)
+	$(CXX) $(CXXFLAGS) src/main_bench.cpp $(LDFLAGS_BENCH) -o $@
 
 clean:
-	rm -f $(OBJ) libnexus_engine.so nexus_bench
+	rm -f $(OBJ) libnexus_engine.so libnexus_engine.dylib nexus_bench

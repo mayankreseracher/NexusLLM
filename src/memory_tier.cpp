@@ -5,13 +5,37 @@
 namespace nexus {
 
 MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_capacity_bytes)
-    : tier0_capacity_(tier0_capacity_bytes), tier1_capacity_(tier1_capacity_bytes) {
+    : platform_profile_(PlatformHardwareProfile::detect()),
+      tier0_capacity_(tier0_capacity_bytes), 
+      tier1_capacity_(tier1_capacity_bytes) {
 
 #if defined(NEXUS_PLATFORM_WINDOWS)
     // Allocate Tier 0 (Active Working Set) in pinned memory
     tier0_raw_pool_ = VirtualAlloc(NULL, tier0_capacity_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     // Allocate Tier 1 (Host System RAM) for full model weights / inactive parameter residency
     tier1_raw_pool_ = VirtualAlloc(NULL, tier1_capacity_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(NEXUS_PLATFORM_MACOS)
+    // macOS POSIX anonymous mapping (Zero-copy unified memory backing)
+    tier0_raw_pool_ = mmap(NULL, tier0_capacity_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    tier1_raw_pool_ = mmap(NULL, tier1_capacity_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (tier0_raw_pool_ == MAP_FAILED) tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
+    if (tier1_raw_pool_ == MAP_FAILED) tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
+#elif defined(NEXUS_PLATFORM_LINUX)
+    // Linux Transparent Huge Pages (THP) allocation via mmap & madvise
+    tier0_raw_pool_ = mmap(NULL, tier0_capacity_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    tier1_raw_pool_ = mmap(NULL, tier1_capacity_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tier0_raw_pool_ == MAP_FAILED) tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
+    if (tier1_raw_pool_ == MAP_FAILED) tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
+
+#if defined(MADV_HUGEPAGE)
+    if (tier0_raw_pool_ != MAP_FAILED) {
+        madvise(tier0_raw_pool_, tier0_capacity_, MADV_HUGEPAGE);
+    }
+    if (tier1_raw_pool_ != MAP_FAILED) {
+        madvise(tier1_raw_pool_, tier1_capacity_, MADV_HUGEPAGE);
+    }
+#endif
+
 #else
     tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
     tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
@@ -43,6 +67,9 @@ MemoryTierManager::~MemoryTierManager() {
 #if defined(NEXUS_PLATFORM_WINDOWS)
     if (tier0_raw_pool_) VirtualFree(tier0_raw_pool_, 0, MEM_RELEASE);
     if (tier1_raw_pool_) VirtualFree(tier1_raw_pool_, 0, MEM_RELEASE);
+#elif defined(NEXUS_PLATFORM_POSIX)
+    if (tier0_raw_pool_ && tier0_raw_pool_ != MAP_FAILED) munmap(tier0_raw_pool_, tier0_capacity_);
+    if (tier1_raw_pool_ && tier1_raw_pool_ != MAP_FAILED) munmap(tier1_raw_pool_, tier1_capacity_);
 #else
     if (tier0_raw_pool_) free(tier0_raw_pool_);
     if (tier1_raw_pool_) free(tier1_raw_pool_);
@@ -95,7 +122,23 @@ void* MemoryTierManager::activate_parameter(const std::string& name) {
         return tv->active_ptr;
     }
 
-    // Allocate from Tier 0 working slot
+    // High-performance UMA Zero-Copy Path for macOS Apple Silicon
+    if (platform_profile_.is_unified_memory) {
+        tv->active_ptr = tv->host_ptr;
+        tv->is_active = true;
+        tv->current_tier = MemoryTier::TIER0_ACTIVE_WORKING_SET;
+
+        std::lock_guard<std::mutex> sl(stats_mutex_);
+        stats_.prefetch_hits++;
+        stats_.tier0_allocated_bytes += tv->byte_size;
+        if (stats_.tier1_inactive_bytes >= tv->byte_size) {
+            stats_.tier1_inactive_bytes -= tv->byte_size;
+        }
+        stats_.pcie_bandwidth_gbps = platform_profile_.theoretical_bandwidth_gbps;
+        return tv->active_ptr;
+    }
+
+    // Discrete PCIe Copy Path (Windows / Linux discrete GPUs)
     WorkingBufferSlot* slot = acquire_active_slot(tv->byte_size);
     if (!slot) return nullptr;
 
@@ -127,6 +170,15 @@ void* MemoryTierManager::activate_parameter(const std::string& name) {
 }
 
 NexusStatus MemoryTierManager::prefetch_parameter_async(const std::string& name) {
+#if defined(NEXUS_PLATFORM_POSIX) && defined(MADV_WILLNEED)
+    {
+        std::lock_guard<std::mutex> lock(registry_mutex_);
+        auto it = registry_.find(name);
+        if (it != registry_.end() && it->second->host_ptr) {
+            madvise(it->second->host_ptr, it->second->byte_size, MADV_WILLNEED);
+        }
+    }
+#endif
     {
         std::lock_guard<std::mutex> lock(prefetch_mutex_);
         prefetch_queue_.push(name);
@@ -145,6 +197,12 @@ NexusStatus MemoryTierManager::deactivate_parameter(const std::string& name) {
         tv->is_active = false;
         tv->active_ptr = nullptr;
         tv->current_tier = MemoryTier::TIER1_HOST_SYSTEM_RAM;
+
+#if defined(NEXUS_PLATFORM_POSIX) && defined(MADV_COLD)
+        if (tv->host_ptr) {
+            madvise(tv->host_ptr, tv->byte_size, MADV_COLD);
+        }
+#endif
 
         std::lock_guard<std::mutex> sl(stats_mutex_);
         if (stats_.tier0_allocated_bytes >= tv->byte_size) {

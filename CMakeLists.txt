@@ -6,10 +6,31 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(include)
 
+# Architecture & OS Specific Tuning
 if(MSVC)
     add_compile_options(/O2 /W3 /arch:AVX2)
-else()
-    add_compile_options(-O3 -Wall -Wextra -mavx2 -mfma -pthread)
+elseif(APPLE)
+    # macOS (Apple Silicon M-Series & Intel)
+    add_compile_options(-O3 -Wall -Wextra -pthread)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        message(STATUS "[Nexus Engine] Detected Apple Silicon (ARM64) - Enabling UMA Zero-Copy & NEON Acceleration")
+        add_compile_options(-march=armv8.5-a)
+    else()
+        message(STATUS "[Nexus Engine] Detected macOS x86_64 - Enabling AVX2")
+        add_compile_options(-mavx2 -mfma)
+    endif()
+    set(CMAKE_SHARED_LIBRARY_SUFFIX ".dylib")
+elseif(UNIX)
+    # Linux (Ubuntu, Debian, RHEL, CentOS, Rocky, Fedora, Arch, Alpine)
+    add_compile_options(-O3 -Wall -Wextra -fPIC -pthread)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
+        message(STATUS "[Nexus Engine] Detected Linux x86_64 - Enabling AVX2 & FMA")
+        add_compile_options(-mavx2 -mfma)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        message(STATUS "[Nexus Engine] Detected Linux aarch64 - Enabling ARM NEON")
+        add_compile_options(-march=armv8-a+simd)
+    endif()
+    set(CMAKE_SHARED_LIBRARY_SUFFIX ".so")
 endif()
 
 # Core dynamic library
@@ -24,6 +45,10 @@ add_library(nexus_engine SHARED
 )
 
 target_include_directories(nexus_engine PUBLIC include)
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(nexus_engine PRIVATE dl pthread)
+endif()
 
 # Standalone benchmark executable
 add_executable(nexus_bench src/main_bench.cpp)

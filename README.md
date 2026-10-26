@@ -81,15 +81,30 @@ nexus_engine/
 ## Quickstart
 
 ### 1. Build Native C++ Engine
+
+**On Linux (Ubuntu / Debian / RHEL / Fedora / Arch / Alpine) or macOS (Apple Silicon / Intel):**
+```bash
+chmod +x build.sh
+./build.sh
+```
+Or with Make:
+```bash
+make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+```
+
+**On Windows:**
 ```cmd
 build.bat
 ```
-Produces `nexus_engine.dll` and standalone `nexus_bench.exe`.
+Produces `libnexus_engine.so` / `libnexus_engine.dylib` / `nexus_engine.dll` and standalone `nexus_bench`.
 
 ### 2. Run Native C++ Benchmark
-```cmd
-nexus_bench.exe
+```bash
+./nexus_bench          # Linux / macOS
+nexus_bench.exe        # Windows
 ```
+
+For full architectural details on platform hardware profiles, memory bandwidth comparisons, and Linux/macOS specific optimizations, see [PLATFORM_CAPABILITIES_AND_PERFORMANCE.md](PLATFORM_CAPABILITIES_AND_PERFORMANCE.md).
 
 ### 3. Run Python Benchmark Suite
 ```cmd

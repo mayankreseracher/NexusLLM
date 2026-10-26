@@ -21,7 +21,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    NexusPlatformInfo pinfo;
+    nexus_get_platform_info(&pinfo);
+
     std::cout << "[Nexus Engine] Engine initialized successfully." << std::endl;
+    std::cout << "[Platform HW]  Operating System       : " << pinfo.os_name << std::endl;
+    std::cout << "[Platform HW]  CPU Architecture       : " << pinfo.cpu_arch << std::endl;
+    std::cout << "[Platform HW]  Vector Engine          : " << pinfo.vector_isa_name << std::endl;
+    std::cout << "[Platform HW]  Unified Memory (UMA)   : " << (pinfo.is_unified_memory ? "YES (Zero-Copy Enabled)" : "NO (PCIe Offload)") << std::endl;
+    std::cout << "[Platform HW]  Transparent HugePages  : " << (pinfo.has_transparent_hugepages ? "YES (2MB Pages Enabled)" : "NO") << std::endl;
+    std::cout << "[Platform HW]  Hardware Concurrency   : " << pinfo.hardware_concurrency << " threads" << std::endl;
+    std::cout << "[Platform HW]  Theoretical Peak BW    : " << pinfo.theoretical_bandwidth_gbps << " GB/s" << std::endl;
+    std::cout << "[Platform HW]  Performance Profile    : " << pinfo.performance_tier_desc << std::endl;
+    std::cout << "----------------------------------------------------------------" << std::endl;
     std::cout << "[Nexus Engine] Tier 0 (Active Working Set): " << (tier0_bytes / (1024 * 1024)) << " MB" << std::endl;
     std::cout << "[Nexus Engine] Tier 1 (Host RAM Residency): " << (tier1_bytes / (1024 * 1024)) << " MB" << std::endl;
 

@@ -33,9 +33,25 @@ typedef struct {
     double prefix_cache_hit_rate;
 } NexusLocalMemoryStats;
 
+typedef struct {
+    uint32_t os_type;            // 0=Windows, 1=macOS, 2=Ubuntu/Debian, 3=RHEL/CentOS, 4=Fedora, 5=Arch, 6=Alpine, 7=Generic Linux, 8=POSIX
+    char os_name[64];
+    char cpu_arch[32];
+    uint32_t vector_isa;         // 0=Scalar, 1=NEON, 2=AVX2+FMA, 3=AVX512
+    char vector_isa_name[32];
+    uint32_t is_unified_memory;  // 1 if Apple Silicon UMA / APU, 0 if discrete PCIe
+    uint32_t has_transparent_hugepages; // 1 if Linux THP enabled
+    uint32_t hardware_concurrency;
+    double theoretical_bandwidth_gbps;
+    char performance_tier_desc[128];
+} NexusPlatformInfo;
+
 // Lifecycle
 NEXUS_API NexusEngineHandle nexus_create_engine(size_t tier0_bytes, size_t tier1_bytes, size_t max_kv_blocks);
 NEXUS_API void nexus_destroy_engine(NexusEngineHandle engine);
+
+// Platform & Hardware Capability Discovery
+NEXUS_API void nexus_get_platform_info(NexusPlatformInfo* out_info);
 
 // Model loading
 NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* filepath);
