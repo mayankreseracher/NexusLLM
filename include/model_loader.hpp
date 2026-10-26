@@ -47,6 +47,18 @@ private:
     ModelMetadata metadata_;
     ModelFormat detected_format_ = ModelFormat::SAFETENSORS;
     std::vector<std::string> loaded_tensors_;
+
+    void* mmap_base_ = nullptr;
+    size_t mmap_size_ = 0;
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    void* win_file_handle_ = nullptr;
+    void* win_map_handle_ = nullptr;
+#else
+    int posix_fd_ = -1;
+#endif
+
+    void unmap_file();
+    void register_aliases(const std::string& name, DataType dt, const TensorShape& shape, const void* ptr);
 };
 
 } // namespace nexus

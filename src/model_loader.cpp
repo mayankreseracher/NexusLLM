@@ -1,14 +1,115 @@
 #include "model_loader.hpp"
+#include "quantization.hpp"
 #include <iostream>
 #include <sstream>
 #include <cstring>
+#include <vector>
+#include <algorithm>
+
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#else
+    #include <sys/mman.h>
+    #include <sys/stat.h>
+    #include <fcntl.h>
+    #include <unistd.h>
+#endif
 
 namespace nexus {
 
 UniversalModelLoader::UniversalModelLoader(std::shared_ptr<MemoryTierManager> tier_mgr)
     : tier_mgr_(tier_mgr) {}
 
-UniversalModelLoader::~UniversalModelLoader() {}
+UniversalModelLoader::~UniversalModelLoader() {
+    unmap_file();
+}
+
+void UniversalModelLoader::unmap_file() {
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    if (mmap_base_) {
+        UnmapViewOfFile(mmap_base_);
+        mmap_base_ = nullptr;
+    }
+    if (win_map_handle_) {
+        CloseHandle(static_cast<HANDLE>(win_map_handle_));
+        win_map_handle_ = nullptr;
+    }
+    if (win_file_handle_ && win_file_handle_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(static_cast<HANDLE>(win_file_handle_));
+        win_file_handle_ = nullptr;
+    }
+#else
+    if (mmap_base_ && mmap_base_ != MAP_FAILED) {
+        munmap(mmap_base_, mmap_size_);
+        mmap_base_ = nullptr;
+    }
+    if (posix_fd_ >= 0) {
+        close(posix_fd_);
+        posix_fd_ = -1;
+    }
+#endif
+    mmap_size_ = 0;
+}
+
+void UniversalModelLoader::register_aliases(const std::string& name, DataType dt, const TensorShape& shape, const void* ptr) {
+    if (!ptr || !tier_mgr_) return;
+
+    // 1. Embedding
+    if (name == "model.embed_tokens.weight" || name == "tok_embeddings.weight") {
+        tier_mgr_->register_parameter_mapped("token_embd.weight", dt, shape, ptr);
+    }
+    // 2. Output / LM Head
+    if (name == "lm_head.weight" || name == "output.weight") {
+        tier_mgr_->register_parameter_mapped("output.weight", dt, shape, ptr);
+    }
+    // 3. Final Norm
+    if (name == "model.norm.weight" || name == "norm.weight") {
+        tier_mgr_->register_parameter_mapped("output_norm.weight", dt, shape, ptr);
+    }
+    // 4. HuggingFace style: model.layers.<l>.*
+    size_t ml_pos = name.find("model.layers.");
+    if (ml_pos != std::string::npos) {
+        size_t next_dot = name.find('.', ml_pos + 13);
+        if (next_dot != std::string::npos) {
+            std::string l_str = name.substr(ml_pos + 13, next_dot - (ml_pos + 13));
+            std::string suffix = name.substr(next_dot + 1);
+            std::string canonical_pfx = "blk." + l_str + ".";
+
+            if (suffix == "self_attn.q_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_q.weight", dt, shape, ptr);
+            else if (suffix == "self_attn.k_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_k.weight", dt, shape, ptr);
+            else if (suffix == "self_attn.v_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_v.weight", dt, shape, ptr);
+            else if (suffix == "self_attn.o_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_output.weight", dt, shape, ptr);
+            else if (suffix == "input_layernorm.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_norm.weight", dt, shape, ptr);
+            else if (suffix == "post_attention_layernorm.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_norm.weight", dt, shape, ptr);
+            else if (suffix == "mlp.gate_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_gate.weight", dt, shape, ptr);
+            else if (suffix == "mlp.up_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_up.weight", dt, shape, ptr);
+            else if (suffix == "mlp.down_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_down.weight", dt, shape, ptr);
+        }
+    }
+    // 5. GGUF blk.<l>.*
+    size_t blk_pos = name.find("blk.");
+    if (blk_pos != std::string::npos) {
+        size_t next_dot = name.find('.', blk_pos + 4);
+        if (next_dot != std::string::npos) {
+            std::string l_str = name.substr(blk_pos + 4, next_dot - (blk_pos + 4));
+            std::string suffix = name.substr(next_dot + 1);
+            std::string hf_pfx = "model.layers." + l_str + ".";
+
+            if (suffix == "attn_q.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.q_proj.weight", dt, shape, ptr);
+            else if (suffix == "attn_k.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.k_proj.weight", dt, shape, ptr);
+            else if (suffix == "attn_v.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.v_proj.weight", dt, shape, ptr);
+            else if (suffix == "attn_output.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.o_proj.weight", dt, shape, ptr);
+            else if (suffix == "attn_norm.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "input_layernorm.weight", dt, shape, ptr);
+            else if (suffix == "ffn_norm.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "post_attention_layernorm.weight", dt, shape, ptr);
+            else if (suffix == "ffn_gate.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "mlp.gate_proj.weight", dt, shape, ptr);
+            else if (suffix == "ffn_up.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "mlp.up_proj.weight", dt, shape, ptr);
+            else if (suffix == "ffn_down.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "mlp.down_proj.weight", dt, shape, ptr);
+        }
+    }
+}
 
 NexusStatus UniversalModelLoader::load_model(const std::string& model_path) {
     if (model_path.find(".safetensors") != std::string::npos) {
@@ -103,101 +204,398 @@ NexusStatus UniversalModelLoader::load_safetensors(const std::string& filepath) 
 }
 
 NexusStatus UniversalModelLoader::load_gguf(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
+    unmap_file();
+
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    HANDLE hFile = CreateFileA(
+        filepath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+        NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
         std::cerr << "[UniversalModelLoader] Cannot open GGUF file: " << filepath << std::endl;
         return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
     }
+    win_file_handle_ = static_cast<void*>(hFile);
 
-    // Check GGUF magic: 'GGUF' (0x46554747)
-    uint32_t magic = 0;
-    file.read(reinterpret_cast<char*>(&magic), 4);
+    LARGE_INTEGER fs;
+    if (!GetFileSizeEx(hFile, &fs) || fs.QuadPart == 0) {
+        std::cerr << "[UniversalModelLoader] Failed to get file size: " << filepath << std::endl;
+        unmap_file();
+        return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+    }
+    mmap_size_ = static_cast<size_t>(fs.QuadPart);
+
+    HANDLE hMap = CreateFileMappingA(
+        hFile,
+        NULL,
+        PAGE_READONLY,
+        0,
+        0,
+        NULL
+    );
+    if (!hMap) {
+        std::cerr << "[UniversalModelLoader] CreateFileMapping failed for: " << filepath << std::endl;
+        unmap_file();
+        return NexusStatus::ERROR_OUT_OF_HOST_MEMORY;
+    }
+    win_map_handle_ = static_cast<void*>(hMap);
+
+    void* pView = MapViewOfFile(
+        hMap,
+        FILE_MAP_READ,
+        0,
+        0,
+        0
+    );
+    if (!pView) {
+        std::cerr << "[UniversalModelLoader] MapViewOfFile failed for: " << filepath << std::endl;
+        unmap_file();
+        return NexusStatus::ERROR_OUT_OF_HOST_MEMORY;
+    }
+    mmap_base_ = pView;
+#else
+    posix_fd_ = open(filepath.c_str(), O_RDONLY);
+    if (posix_fd_ < 0) {
+        std::cerr << "[UniversalModelLoader] Cannot open GGUF file: " << filepath << std::endl;
+        return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+    }
+    struct stat st;
+    if (fstat(posix_fd_, &st) != 0 || st.st_size == 0) {
+        std::cerr << "[UniversalModelLoader] Failed to get file size: " << filepath << std::endl;
+        unmap_file();
+        return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+    }
+    mmap_size_ = static_cast<size_t>(st.st_size);
+
+    mmap_base_ = mmap(NULL, mmap_size_, PROT_READ, MAP_SHARED, posix_fd_, 0);
+    if (mmap_base_ == MAP_FAILED) {
+        mmap_base_ = nullptr;
+        std::cerr << "[UniversalModelLoader] mmap failed for: " << filepath << std::endl;
+        unmap_file();
+        return NexusStatus::ERROR_OUT_OF_HOST_MEMORY;
+    }
+#if defined(MADV_RANDOM)
+    madvise(mmap_base_, mmap_size_, MADV_RANDOM);
+#endif
+#endif
+
+    const uint8_t* ptr = static_cast<const uint8_t*>(mmap_base_);
+    const uint8_t* end = ptr + mmap_size_;
+
+    // Check magic: 'GGUF' (0x46554747)
+    if (ptr + 16 > end) {
+        unmap_file();
+        return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+    }
+    uint32_t magic = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
     if (magic != 0x46554747) {
         std::cerr << "[UniversalModelLoader] File does not have GGUF magic bytes." << std::endl;
+        unmap_file();
         return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
     }
 
-    uint32_t version = 0;
-    file.read(reinterpret_cast<char*>(&version), 4);
-    uint64_t tensor_count = 0;
-    uint64_t metadata_kv_count = 0;
-    file.read(reinterpret_cast<char*>(&tensor_count), 8);
-    file.read(reinterpret_cast<char*>(&metadata_kv_count), 8);
+    uint32_t version = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+    uint64_t tensor_count = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+    uint64_t metadata_kv_count = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
 
-    std::cout << "[UniversalModelLoader] Parsing GGUF v" << version 
-              << " with " << tensor_count << " tensors, " 
-              << metadata_kv_count << " metadata KV pairs." << std::endl;
+    std::cout << "[UniversalModelLoader] Zero-Copy Memory-Mapped GGUF v" << version 
+              << " (" << (mmap_size_ / (1024 * 1024)) << " MB, "
+              << tensor_count << " tensors, " 
+              << metadata_kv_count << " metadata KV pairs)." << std::endl;
 
-    // Read metadata KV pairs
+    uint32_t alignment = 32;
+
+    auto read_string = [&](std::string& out) -> bool {
+        if (ptr + 8 > end) return false;
+        uint64_t slen = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+        if (ptr + slen > end) return false;
+        out.assign(reinterpret_cast<const char*>(ptr), slen);
+        ptr += slen;
+        return true;
+    };
+
+    // Parse metadata KV pairs
     for (uint64_t i = 0; i < metadata_kv_count; ++i) {
-        uint64_t key_len = 0;
-        file.read(reinterpret_cast<char*>(&key_len), 8);
-        if (key_len > 1024) break;
-        std::string key(key_len, '\0');
-        file.read(&key[0], key_len);
+        std::string key;
+        if (!read_string(key)) {
+            unmap_file();
+            return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+        }
 
-        uint32_t val_type = 0;
-        file.read(reinterpret_cast<char*>(&val_type), 4);
+        if (ptr + 4 > end) {
+            unmap_file();
+            return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+        }
+        uint32_t val_type = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
 
-        if (key == "general.architecture") {
-            uint64_t slen = 0;
-            file.read(reinterpret_cast<char*>(&slen), 8);
-            std::string arch(slen, '\0');
-            file.read(&arch[0], slen);
-            metadata_.architecture = arch;
-        } else if (key == "llama.context_length" && val_type == 4) {
-            uint32_t ctx = 0;
-            file.read(reinterpret_cast<char*>(&ctx), 4);
-            metadata_.max_position_embeddings = ctx;
+        if (val_type == 8) { // STRING
+            std::string str_val;
+            if (!read_string(str_val)) {
+                unmap_file();
+                return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+            }
+            if (key == "general.architecture") {
+                metadata_.architecture = str_val;
+            }
+            metadata_.custom_attributes[key] = str_val;
+        } else if (val_type == 9) { // ARRAY
+            if (ptr + 12 > end) {
+                unmap_file();
+                return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+            }
+            uint32_t elem_type = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+            uint64_t arr_len = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+
+            if (key == "tokenizer.ggml.tokens" || key.find(".tokens") != std::string::npos) {
+                if (arr_len > 0) {
+                    metadata_.vocab_size = static_cast<uint32_t>(arr_len);
+                }
+            }
+
+            if (elem_type == 8) { // Array of strings
+                for (uint64_t a = 0; a < arr_len; ++a) {
+                    if (ptr + 8 > end) {
+                        unmap_file();
+                        return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+                    }
+                    uint64_t slen = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+                    if (ptr + slen > end) {
+                        unmap_file();
+                        return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+                    }
+                    ptr += slen;
+                }
+            } else {
+                size_t el_sz = 1;
+                if (elem_type == 0 || elem_type == 1 || elem_type == 7) el_sz = 1;
+                else if (elem_type == 2 || elem_type == 3) el_sz = 2;
+                else if (elem_type == 4 || elem_type == 5 || elem_type == 6) el_sz = 4;
+                else if (elem_type == 10 || elem_type == 11 || elem_type == 12) el_sz = 8;
+
+                size_t total_skip = arr_len * el_sz;
+                if (ptr + total_skip > end) {
+                    unmap_file();
+                    return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+                }
+                ptr += total_skip;
+            }
         } else {
-            // Skip other metadata values based on type
-            if (val_type == 0 || val_type == 1) file.seekg(1, std::ios::cur);
-            else if (val_type == 2 || val_type == 3) file.seekg(2, std::ios::cur);
-            else if (val_type == 4 || val_type == 5 || val_type == 6) file.seekg(4, std::ios::cur);
-            else if (val_type == 7 || val_type == 10 || val_type == 11) file.seekg(8, std::ios::cur);
-            else if (val_type == 8) {
-                uint64_t slen = 0;
-                file.read(reinterpret_cast<char*>(&slen), 8);
-                file.seekg(slen, std::ios::cur);
+            // Scalar values
+            uint64_t uint_val = 0;
+            float float_val = 0.0f;
+            bool is_num = false;
+
+            if (val_type == 0 || val_type == 1 || val_type == 7) {
+                if (ptr + 1 > end) { unmap_file(); return NexusStatus::ERROR_FORMAT_UNSUPPORTED; }
+                uint_val = *ptr++;
+                is_num = true;
+            } else if (val_type == 2 || val_type == 3) {
+                if (ptr + 2 > end) { unmap_file(); return NexusStatus::ERROR_FORMAT_UNSUPPORTED; }
+                uint_val = *reinterpret_cast<const uint16_t*>(ptr); ptr += 2;
+                is_num = true;
+            } else if (val_type == 4 || val_type == 5) {
+                if (ptr + 4 > end) { unmap_file(); return NexusStatus::ERROR_FORMAT_UNSUPPORTED; }
+                uint_val = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+                is_num = true;
+            } else if (val_type == 6) {
+                if (ptr + 4 > end) { unmap_file(); return NexusStatus::ERROR_FORMAT_UNSUPPORTED; }
+                float_val = *reinterpret_cast<const float*>(ptr); ptr += 4;
+                uint_val = static_cast<uint64_t>(float_val);
+                is_num = true;
+            } else if (val_type == 10 || val_type == 11) {
+                if (ptr + 8 > end) { unmap_file(); return NexusStatus::ERROR_FORMAT_UNSUPPORTED; }
+                uint_val = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+                is_num = true;
+            } else if (val_type == 12) {
+                if (ptr + 8 > end) { unmap_file(); return NexusStatus::ERROR_FORMAT_UNSUPPORTED; }
+                double dval = *reinterpret_cast<const double*>(ptr); ptr += 8;
+                float_val = static_cast<float>(dval);
+                uint_val = static_cast<uint64_t>(dval);
+                is_num = true;
+            }
+
+            if (is_num) {
+                if (key == "general.alignment") {
+                    alignment = static_cast<uint32_t>(uint_val > 0 ? uint_val : 32);
+                } else if (key.find(".context_length") != std::string::npos) {
+                    metadata_.max_position_embeddings = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".embedding_length") != std::string::npos) {
+                    metadata_.hidden_size = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".feed_forward_length") != std::string::npos) {
+                    metadata_.intermediate_size = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".block_count") != std::string::npos) {
+                    metadata_.num_hidden_layers = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".attention.head_count_kv") != std::string::npos) {
+                    metadata_.num_key_value_heads = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".attention.head_count") != std::string::npos) {
+                    metadata_.num_attention_heads = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".rope.freq_base") != std::string::npos) {
+                    metadata_.rope_theta = (float_val > 0.0f) ? float_val : static_cast<float>(uint_val);
+                } else if (key.find(".layer_norm_rms_epsilon") != std::string::npos || key.find(".rms_norm_eps") != std::string::npos) {
+                    metadata_.rms_norm_eps = (float_val > 0.0f) ? float_val : 1e-5f;
+                } else if (key.find(".vocab_size") != std::string::npos) {
+                    metadata_.vocab_size = static_cast<uint32_t>(uint_val);
+                } else if (key.find(".expert_count") != std::string::npos) {
+                    metadata_.num_experts = static_cast<uint32_t>(uint_val);
+                    metadata_.is_moe = (metadata_.num_experts > 1);
+                } else if (key.find(".expert_used_count") != std::string::npos) {
+                    metadata_.num_experts_per_tok = static_cast<uint32_t>(uint_val);
+                }
             }
         }
     }
 
-    // Read tensor infos
+    // Parse tensor info headers
+    struct GGUFTensorInfo {
+        std::string name;
+        std::vector<size_t> dims;
+        uint32_t ggml_type = 0;
+        uint64_t offset = 0;
+    };
+    std::vector<GGUFTensorInfo> tensor_infos;
+    tensor_infos.reserve(tensor_count);
+
     for (uint64_t i = 0; i < tensor_count; ++i) {
-        uint64_t name_len = 0;
-        file.read(reinterpret_cast<char*>(&name_len), 8);
-        if (name_len > 1024) break;
-        std::string t_name(name_len, '\0');
-        file.read(&t_name[0], name_len);
-
-        uint32_t n_dims = 0;
-        file.read(reinterpret_cast<char*>(&n_dims), 4);
-
-        TensorShape shape;
-        for (uint32_t d = 0; d < n_dims; ++d) {
-            uint64_t dim_val = 0;
-            file.read(reinterpret_cast<char*>(&dim_val), 8);
-            shape.dims.push_back(dim_val);
+        std::string t_name;
+        if (!read_string(t_name)) {
+            unmap_file();
+            return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
         }
 
-        uint32_t ggml_type = 0;
-        file.read(reinterpret_cast<char*>(&ggml_type), 4);
-        uint64_t offset = 0;
-        file.read(reinterpret_cast<char*>(&offset), 8);
+        if (ptr + 4 > end) {
+            unmap_file();
+            return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+        }
+        uint32_t n_dims = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+        if (n_dims > 8) {
+            unmap_file();
+            return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+        }
+
+        GGUFTensorInfo info;
+        info.name = t_name;
+
+        for (uint32_t d = 0; d < n_dims; ++d) {
+            if (ptr + 8 > end) {
+                unmap_file();
+                return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+            }
+            uint64_t dim_val = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+            info.dims.push_back(static_cast<size_t>(dim_val));
+        }
+
+        if (ptr + 12 > end) {
+            unmap_file();
+            return NexusStatus::ERROR_FORMAT_UNSUPPORTED;
+        }
+        info.ggml_type = *reinterpret_cast<const uint32_t*>(ptr); ptr += 4;
+        info.offset = *reinterpret_cast<const uint64_t*>(ptr); ptr += 8;
+
+        tensor_infos.push_back(std::move(info));
+    }
+
+    // Align to get tensor data base offset
+    size_t cur_offset = static_cast<size_t>(ptr - static_cast<const uint8_t*>(mmap_base_));
+    size_t tensor_data_base = (cur_offset + alignment - 1) & ~(alignment - 1);
+
+    loaded_tensors_.clear();
+    size_t max_layer_idx = 0;
+    bool found_any_layer = false;
+
+    // Zero-copy register each mapped tensor into MemoryTierManager
+    for (const auto& info : tensor_infos) {
+        size_t full_tensor_offset = tensor_data_base + info.offset;
+        if (full_tensor_offset >= mmap_size_) {
+            std::cerr << "[UniversalModelLoader] Tensor offset out of file bounds: " << info.name << std::endl;
+            continue;
+        }
+        const void* mapped_tensor_ptr = static_cast<const char*>(mmap_base_) + full_tensor_offset;
 
         DataType dt = DataType::FP32;
-        if (ggml_type == 2) dt = DataType::GGUF_Q4_0;
-        else if (ggml_type == 12) dt = DataType::GGUF_Q4_K;
-        else if (ggml_type == 1) dt = DataType::FP16;
+        if (info.ggml_type == 0) dt = DataType::FP32;
+        else if (info.ggml_type == 1) dt = DataType::FP16;
+        else if (info.ggml_type == 2 || info.ggml_type == 3) dt = DataType::GGUF_Q4_0;
+        else if (info.ggml_type == 8) dt = DataType::GGUF_Q8_0;
+        else if (info.ggml_type == 12) dt = DataType::GGUF_Q4_K;
+        else if (info.ggml_type == 24) dt = DataType::BF16;
 
-        size_t t_bytes = shape.total_bytes(dt);
-        tier_mgr_->register_parameter(t_name, dt, shape, nullptr);
-        loaded_tensors_.push_back(t_name);
+        TensorShape shape;
+        shape.dims = info.dims;
+
+        tier_mgr_->register_parameter_mapped(info.name, dt, shape, mapped_tensor_ptr);
+        loaded_tensors_.push_back(info.name);
+
+        // Discover layer index
+        size_t blk_pos = info.name.find("blk.");
+        if (blk_pos != std::string::npos) {
+            size_t next_dot = info.name.find('.', blk_pos + 4);
+            if (next_dot != std::string::npos) {
+                try {
+                    size_t l_idx = std::stoul(info.name.substr(blk_pos + 4, next_dot - (blk_pos + 4)));
+                    if (l_idx > max_layer_idx) max_layer_idx = l_idx;
+                    found_any_layer = true;
+                } catch (...) {}
+            }
+        }
+        size_t layer_pos = info.name.find("model.layers.");
+        if (layer_pos != std::string::npos) {
+            size_t next_dot = info.name.find('.', layer_pos + 13);
+            if (next_dot != std::string::npos) {
+                try {
+                    size_t l_idx = std::stoul(info.name.substr(layer_pos + 13, next_dot - (layer_pos + 13)));
+                    if (l_idx > max_layer_idx) max_layer_idx = l_idx;
+                    found_any_layer = true;
+                } catch (...) {}
+            }
+        }
+
+        // Register canonical aliases
+        register_aliases(info.name, dt, shape, mapped_tensor_ptr);
+    }
+
+    // Weight tying fallback: if output.weight is not present, alias to token_embd.weight
+    auto tv_out = tier_mgr_->get_tensor_view("output.weight");
+    auto tv_emb = tier_mgr_->get_tensor_view("token_embd.weight");
+    if (!tv_out && tv_emb) {
+        tier_mgr_->register_parameter_mapped("output.weight", tv_emb->dtype, tv_emb->shape, tv_emb->host_ptr);
+    }
+
+    // Infer any missing architecture dimensions from tensor metadata
+    if (found_any_layer && metadata_.num_hidden_layers == 0) {
+        metadata_.num_hidden_layers = static_cast<uint32_t>(max_layer_idx + 1);
+    }
+    if (tv_emb) {
+        if (metadata_.hidden_size == 0 && tv_emb->shape.dims.size() >= 2) {
+            metadata_.hidden_size = static_cast<uint32_t>(std::min(tv_emb->shape.dims[0], tv_emb->shape.dims[1]));
+        }
+        if (metadata_.vocab_size == 0 && tv_emb->shape.dims.size() >= 2) {
+            metadata_.vocab_size = static_cast<uint32_t>(std::max(tv_emb->shape.dims[0], tv_emb->shape.dims[1]));
+        }
+    }
+    if (metadata_.num_attention_heads == 0 && metadata_.hidden_size > 0) {
+        metadata_.num_attention_heads = static_cast<uint32_t>(metadata_.hidden_size / 64);
+        if (metadata_.num_attention_heads == 0) metadata_.num_attention_heads = 4;
+    }
+    if (metadata_.num_key_value_heads == 0) {
+        metadata_.num_key_value_heads = metadata_.num_attention_heads;
+    }
+    if (metadata_.intermediate_size == 0 && metadata_.hidden_size > 0) {
+        metadata_.intermediate_size = metadata_.hidden_size * 2;
     }
 
     std::cout << "[UniversalModelLoader] Registered " << loaded_tensors_.size() 
-              << " GGUF tensors into Tier 1 Host RAM." << std::endl;
+              << " GGUF parameters into Tier 1 Host RAM via zero-copy mmap ("
+              << metadata_.num_hidden_layers << " layers, hidden=" 
+              << metadata_.hidden_size << ", heads=" 
+              << metadata_.num_attention_heads << ", kv_heads="
+              << metadata_.num_key_value_heads << ", vocab=" 
+              << metadata_.vocab_size << ")." << std::endl;
+
     return NexusStatus::SUCCESS;
 }
 

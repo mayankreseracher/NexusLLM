@@ -40,6 +40,12 @@ public:
                                    const TensorShape& shape, 
                                    const void* source_data = nullptr);
 
+    // Register a memory-mapped parameter directly backed by OS page cache / NVMe file mapping
+    NexusStatus register_parameter_mapped(const std::string& name, 
+                                          DataType dtype, 
+                                          const TensorShape& shape, 
+                                          const void* mapped_ptr);
+
     // Dynamic activation: Bring tensor into Tier 0 (Active working set)
     void* activate_parameter(const std::string& name);
 

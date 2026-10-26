@@ -66,8 +66,15 @@ NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* fi
     auto* eng = static_cast<InternalEngine*>(engine);
     auto status = eng->loader->load_model(filepath);
     if (status == nexus::NexusStatus::SUCCESS) {
+        const auto& meta = eng->loader->get_metadata();
+        size_t n_layers = meta.num_hidden_layers > 0 ? meta.num_hidden_layers : 4;
+        size_t n_heads = meta.num_attention_heads > 0 ? meta.num_attention_heads : 4;
+        size_t n_kv_heads = meta.num_key_value_heads > 0 ? meta.num_key_value_heads : n_heads;
+        size_t h_dim = (n_heads > 0 && meta.hidden_size > 0) ? (meta.hidden_size / n_heads) : 64;
+        eng->kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(eng->kv_mgr->get_total_blocks_count(), n_layers, n_kv_heads, h_dim);
+        eng->control_plane = std::make_unique<nexus::DisaggregatedControlPlane>(eng->kv_mgr);
         eng->transformer = std::make_unique<nexus::TransformerEngine>(
-            eng->tier_mgr, eng->kv_mgr, eng->loader->get_metadata()
+            eng->tier_mgr, eng->kv_mgr, meta
         );
     }
     return static_cast<int32_t>(status);

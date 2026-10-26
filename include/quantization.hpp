@@ -31,6 +31,20 @@ struct BlockAWQ_G128 {
 
 class QuantizationKernel {
 public:
+    // Helper: Convert FP16 uint16_t to FP32 float
+    static inline float fp16_to_fp32(uint16_t h) {
+        uint32_t w = (h & 0x7fff) << 13;
+        uint32_t sign = (h & 0x8000) << 16;
+        uint32_t exp = (h & 0x7c00) >> 10;
+        if (exp == 0x1f) {
+            return 0.0f; // Inf/NaN simplified
+        }
+        float out;
+        uint32_t val = sign | (w + (0x70 << 23));
+        std::memcpy(&out, &val, 4);
+        return out;
+    }
+
     // Dequantize INT4 AWQ packed array into float32
     static void dequantize_int4_awq(const uint32_t* packed, 
                                    const float* scales, 

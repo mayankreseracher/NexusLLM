@@ -294,7 +294,8 @@ enum class NexusStatus : int32_t {
     ERROR_SHAPE_MISMATCH = -5,
     ERROR_INVALID_KV_BLOCK = -6,
     ERROR_NUMERICAL_OVERFLOW = -7,
-    ERROR_ASYNC_PREFETCH_FAILED = -8
+    ERROR_ASYNC_PREFETCH_FAILED = -8,
+    ERROR_INVALID_ARGUMENT = -9
 };
 
 inline const char* status_to_string(NexusStatus status) {
@@ -308,6 +309,7 @@ inline const char* status_to_string(NexusStatus status) {
         case NexusStatus::ERROR_INVALID_KV_BLOCK: return "ERROR_INVALID_KV_BLOCK";
         case NexusStatus::ERROR_NUMERICAL_OVERFLOW: return "ERROR_NUMERICAL_OVERFLOW";
         case NexusStatus::ERROR_ASYNC_PREFETCH_FAILED: return "ERROR_ASYNC_PREFETCH_FAILED";
+        case NexusStatus::ERROR_INVALID_ARGUMENT: return "ERROR_INVALID_ARGUMENT";
         default: return "UNKNOWN_ERROR";
     }
 }

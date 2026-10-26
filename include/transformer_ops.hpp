@@ -12,16 +12,33 @@ namespace nexus {
 
 class TransformerOps {
 public:
-    // Root Mean Square Normalization: out = (x / sqrt(mean(x^2) + eps)) * weight
-    static void rmsnorm(const float* x, const float* weight, float* out, size_t dim, float eps = 1e-6f) {
+    // Root Mean Square Normalization with flexible DataType support (FP32, FP16)
+    static void rmsnorm(const float* x, const void* weight, DataType dt, float* out, size_t dim, float eps = 1e-6f) {
         float sum_sq = 0.0f;
         for (size_t i = 0; i < dim; ++i) {
             sum_sq += x[i] * x[i];
         }
         float inv_rms = 1.0f / std::sqrt((sum_sq / static_cast<float>(dim)) + eps);
-        for (size_t i = 0; i < dim; ++i) {
-            out[i] = x[i] * inv_rms * (weight ? weight[i] : 1.0f);
+        if (!weight) {
+            for (size_t i = 0; i < dim; ++i) {
+                out[i] = x[i] * inv_rms;
+            }
+        } else if (dt == DataType::FP16) {
+            const uint16_t* w16 = static_cast<const uint16_t*>(weight);
+            for (size_t i = 0; i < dim; ++i) {
+                out[i] = x[i] * inv_rms * QuantizationKernel::fp16_to_fp32(w16[i]);
+            }
+        } else {
+            const float* w32 = static_cast<const float*>(weight);
+            for (size_t i = 0; i < dim; ++i) {
+                out[i] = x[i] * inv_rms * w32[i];
+            }
         }
+    }
+
+    // Root Mean Square Normalization: out = (x / sqrt(mean(x^2) + eps)) * weight
+    static void rmsnorm(const float* x, const float* weight, float* out, size_t dim, float eps = 1e-6f) {
+        rmsnorm(x, static_cast<const void*>(weight), DataType::FP32, out, dim, eps);
     }
 
     // Rotary Position Embedding (RoPE) applied to Q and K

@@ -20,7 +20,7 @@ TransformerEngine::TransformerEngine(
         num_heads_ = metadata_.num_attention_heads > 0 ? metadata_.num_attention_heads : 4;
         num_kv_heads_ = metadata_.num_key_value_heads > 0 ? metadata_.num_key_value_heads : num_heads_;
         head_dim_ = hidden_size_ / num_heads_;
-        vocab_size_ = metadata_.vocab_size > 0 ? std::min<size_t>(metadata_.vocab_size, 32000) : 1000;
+        vocab_size_ = metadata_.vocab_size > 0 ? metadata_.vocab_size : 32000;
     } else {
         // Fast, deterministic dimensions for standalone micro-benchmarks / tests
         hidden_size_ = (metadata_.hidden_size > 0 && metadata_.hidden_size <= 512) ? metadata_.hidden_size : 256;
@@ -51,6 +51,14 @@ TransformerEngine::TransformerEngine(
 
 void TransformerEngine::initialize_default_weights() {
     if (weights_ready_) return;
+
+    // If real weights are already registered in tier_mgr_, do NOT overwrite with defaults
+    if (tier_mgr_ && (tier_mgr_->get_tensor_view("output.weight") != nullptr ||
+                      tier_mgr_->get_tensor_view("token_embd.weight") != nullptr ||
+                      tier_mgr_->get_tensor_view("blk.0.attn_q.weight") != nullptr)) {
+        weights_ready_ = true;
+        return;
+    }
 
     // Generate deterministic normalized weight matrices so forward execution produces genuine distributions
     std::mt19937 rng(42);
@@ -141,10 +149,39 @@ int32_t TransformerEngine::forward_token(
     // 1. Embedding lookup
     size_t safe_tok = static_cast<size_t>(std::abs(current_token)) % vocab_size_;
     void* emb_raw = tier_mgr_ ? tier_mgr_->activate_parameter("token_embd.weight") : nullptr;
-    const float* emb_row = emb_raw ? 
-        (static_cast<const float*>(emb_raw) + (safe_tok * hidden_size_)) : 
-        (default_embed_table_.data() + (safe_tok * hidden_size_));
-    std::memcpy(act_x_.data(), emb_row, hidden_size_ * sizeof(float));
+    TensorView* tv_emb = tier_mgr_ ? tier_mgr_->get_tensor_view("token_embd.weight") : nullptr;
+    DataType dt_emb = tv_emb ? tv_emb->dtype : DataType::FP32;
+
+    if (emb_raw) {
+        if (dt_emb == DataType::FP32) {
+            const float* emb_row = static_cast<const float*>(emb_raw) + (safe_tok * hidden_size_);
+            std::memcpy(act_x_.data(), emb_row, hidden_size_ * sizeof(float));
+        } else if (dt_emb == DataType::FP16) {
+            const uint16_t* emb_row = static_cast<const uint16_t*>(emb_raw) + (safe_tok * hidden_size_);
+            for (size_t i = 0; i < hidden_size_; ++i) {
+                act_x_[i] = QuantizationKernel::fp16_to_fp32(emb_row[i]);
+            }
+        } else if (dt_emb == DataType::GGUF_Q4_0) {
+            size_t blocks_per_row = hidden_size_ / 32;
+            const BlockQ4_0* blocks = static_cast<const BlockQ4_0*>(emb_raw) + (safe_tok * blocks_per_row);
+            QuantizationKernel::dequantize_gguf_q4_0(blocks, act_x_.data(), blocks_per_row);
+        } else if (dt_emb == DataType::GGUF_Q8_0) {
+            size_t blocks_per_row = hidden_size_ / 32;
+            const BlockQ8_0* blocks = static_cast<const BlockQ8_0*>(emb_raw) + (safe_tok * blocks_per_row);
+            for (size_t b = 0; b < blocks_per_row; ++b) {
+                float d = QuantizationKernel::fp16_to_fp32(blocks[b].d);
+                for (size_t j = 0; j < 32; ++j) {
+                    act_x_[b * 32 + j] = blocks[b].qs[j] * d;
+                }
+            }
+        } else {
+            const float* emb_row = static_cast<const float*>(emb_raw) + (safe_tok * hidden_size_);
+            std::memcpy(act_x_.data(), emb_row, hidden_size_ * sizeof(float));
+        }
+    } else {
+        const float* emb_row = default_embed_table_.data() + (safe_tok * hidden_size_);
+        std::memcpy(act_x_.data(), emb_row, hidden_size_ * sizeof(float));
+    }
 
     // 2. Multi-Layer Transformer Blocks
     for (size_t l = 0; l < num_layers_; ++l) {
@@ -154,7 +191,7 @@ int32_t TransformerEngine::forward_token(
         }
 
         // Pointer offsets into layer weights or dynamically activated Tier 0 parameters
-        const float* l_weights = default_layer_data_[l].data();
+        const float* l_weights = default_layer_data_.size() > l ? default_layer_data_[l].data() : nullptr;
         size_t offset = 0;
 
         std::string pfx = "blk." + std::to_string(l) + ".";
@@ -168,18 +205,40 @@ int32_t TransformerEngine::forward_token(
         void* w_up_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_up.weight") : nullptr;
         void* w_down_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_down.weight") : nullptr;
 
-        const float* attn_norm = attn_norm_raw ? static_cast<const float*>(attn_norm_raw) : (l_weights + offset); offset += hidden_size_;
-        const float* wq = wq_raw ? static_cast<const float*>(wq_raw) : (l_weights + offset);        offset += (hidden_size_ * hidden_size_);
-        const float* wk = wk_raw ? static_cast<const float*>(wk_raw) : (l_weights + offset);        offset += (num_kv_heads_ * head_dim_ * hidden_size_);
-        const float* wv = wv_raw ? static_cast<const float*>(wv_raw) : (l_weights + offset);        offset += (num_kv_heads_ * head_dim_ * hidden_size_);
-        const float* wo = wo_raw ? static_cast<const float*>(wo_raw) : (l_weights + offset);        offset += (hidden_size_ * hidden_size_);
-        const float* ffn_norm = ffn_norm_raw ? static_cast<const float*>(ffn_norm_raw) : (l_weights + offset);  offset += hidden_size_;
-        const float* w_gate = w_gate_raw ? static_cast<const float*>(w_gate_raw) : (l_weights + offset);    offset += (intermediate_size_ * hidden_size_);
-        const float* w_up = w_up_raw ? static_cast<const float*>(w_up_raw) : (l_weights + offset);      offset += (intermediate_size_ * hidden_size_);
-        const float* w_down = w_down_raw ? static_cast<const float*>(w_down_raw) : (l_weights + offset);
+        TensorView* tv_attn_norm = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_norm.weight") : nullptr;
+        DataType dt_attn_norm = tv_attn_norm ? tv_attn_norm->dtype : DataType::FP32;
+
+        const void* attn_norm = attn_norm_raw ? attn_norm_raw : (l_weights ? (l_weights + offset) : nullptr); 
+        if (l_weights) offset += hidden_size_;
+
+        const void* wq = wq_raw ? wq_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += (hidden_size_ * hidden_size_);
+
+        const void* wk = wk_raw ? wk_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += (num_kv_heads_ * head_dim_ * hidden_size_);
+
+        const void* wv = wv_raw ? wv_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += (num_kv_heads_ * head_dim_ * hidden_size_);
+
+        const void* wo = wo_raw ? wo_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += (hidden_size_ * hidden_size_);
+
+        TensorView* tv_ffn_norm = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_norm.weight") : nullptr;
+        DataType dt_ffn_norm = tv_ffn_norm ? tv_ffn_norm->dtype : DataType::FP32;
+
+        const void* ffn_norm = ffn_norm_raw ? ffn_norm_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += hidden_size_;
+
+        const void* w_gate = w_gate_raw ? w_gate_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += (intermediate_size_ * hidden_size_);
+
+        const void* w_up = w_up_raw ? w_up_raw : (l_weights ? (l_weights + offset) : nullptr);
+        if (l_weights) offset += (intermediate_size_ * hidden_size_);
+
+        const void* w_down = w_down_raw ? w_down_raw : (l_weights ? (l_weights + offset) : nullptr);
 
         // Pre-Attention RMSNorm
-        TransformerOps::rmsnorm(act_x_.data(), attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        TransformerOps::rmsnorm(act_x_.data(), attn_norm, dt_attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
 
         TensorView* tv_wq = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_q.weight") : nullptr;
         DataType dt_wq = tv_wq ? tv_wq->dtype : DataType::FP32;
@@ -250,7 +309,7 @@ int32_t TransformerEngine::forward_token(
         }
 
         // Post-Attention RMSNorm
-        TransformerOps::rmsnorm(act_x_.data(), ffn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+        TransformerOps::rmsnorm(act_x_.data(), ffn_norm, dt_ffn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
 
         // SwiGLU Feed-Forward Network: down(SiLU(gate(x)) * up(x))
         TransformerOps::matmul_vec_dispatch(w_gate, dt_gate, act_norm_.data(), act_gate_.data(), intermediate_size_, hidden_size_);
@@ -262,10 +321,19 @@ int32_t TransformerEngine::forward_token(
         for (size_t i = 0; i < hidden_size_; ++i) {
             act_x_[i] += act_down_[i];
         }
+
+        // Dynamic layer deactivation: evict active working buffers to maintain small Tier 0 footprint
+        if (tier_mgr_) {
+            tier_mgr_->deactivate_parameter(pfx + "attn_q.weight");
+            tier_mgr_->deactivate_parameter(pfx + "ffn_gate.weight");
+        }
     }
 
     // 3. Final RMSNorm
-    TransformerOps::rmsnorm(act_x_.data(), nullptr, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+    void* out_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output_norm.weight") : nullptr;
+    TensorView* tv_out_norm = tier_mgr_ ? tier_mgr_->get_tensor_view("output_norm.weight") : nullptr;
+    DataType dt_out_norm = tv_out_norm ? tv_out_norm->dtype : DataType::FP32;
+    TransformerOps::rmsnorm(act_x_.data(), out_norm_raw, dt_out_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
 
     // 4. LM Head / Logits Projection
     void* head_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output.weight") : nullptr;

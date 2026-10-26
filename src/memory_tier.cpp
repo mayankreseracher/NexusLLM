@@ -126,6 +126,30 @@ NexusStatus MemoryTierManager::register_parameter(const std::string& name,
     return NexusStatus::SUCCESS;
 }
 
+NexusStatus MemoryTierManager::register_parameter_mapped(const std::string& name, 
+                                                        DataType dtype, 
+                                                        const TensorShape& shape, 
+                                                        const void* mapped_ptr) {
+    if (!mapped_ptr) return NexusStatus::ERROR_INVALID_ARGUMENT;
+
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+    size_t req_bytes = shape.total_bytes(dtype);
+
+    auto tv = std::make_shared<TensorView>();
+    tv->name = name;
+    tv->dtype = dtype;
+    tv->shape = shape;
+    tv->byte_size = req_bytes;
+    tv->current_tier = MemoryTier::TIER1_HOST_SYSTEM_RAM;
+    tv->is_active = false;
+    tv->host_ptr = const_cast<void*>(mapped_ptr);
+    tier1_offset_ += req_bytes;
+
+    registry_[name] = tv;
+    stats_.tier1_inactive_bytes += req_bytes;
+    return NexusStatus::SUCCESS;
+}
+
 void* MemoryTierManager::activate_parameter(const std::string& name) {
     std::lock_guard<std::mutex> lock(registry_mutex_);
     auto it = registry_.find(name);
