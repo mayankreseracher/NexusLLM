@@ -1,12 +1,27 @@
-# NexusLLM: Ultra-High-Throughput Heterogeneous-Tiered LLM Inference Engine
+# NexusLLM: Heterogeneous Memory-Tiered LLM Inference Engine (Research Prototype)
 
-NexusLLM is a high-performance LLM inference engine written in **C++20** and **Python 3.12**, featuring native FFI bindings for **Rust** (`nexus-infer`) and **C#/.NET** (`NexusInfer`). 
+NexusLLM is an experimental LLM inference engine written in **C++20** and **Python 3.12**, featuring native FFI bindings for **Rust** (`nexus-infer`) and **C#/.NET** (`NexusInfer`).
 
-Engineered for ultra-high concurrency and maximum throughput (tokens per second - TPS), NexusLLM solves the primary bottleneck of large language model serving—GPU VRAM capacity—by introducing **Dynamic Host RAM Parameter Tiering**, **PagedAttention with strict boundary safety guards**, **Radix Multi-Level Prefix Caching**, **Speculative Multi-Token Verification**, and **Prefill/Decode (PD) Disaggregation**.
+The core research objective of NexusLLM is investigating **Dynamic Host RAM Parameter Tiering** for consumer and edge hardware: keeping inactive transformer layers and Mixture-of-Experts (MoE) parameters in **Host System RAM (Tier 1)** while dynamically streaming the active working set into fast accelerator or pinned memory buffers **(Tier 0)**, alongside **PagedAttention** KV cache management and **Radix Prefix Caching**.
 
 ---
 
-## Architecture & Core Innovations
+## Implementation Status & Roadmap
+
+| Subsystem / Capability | Current Implementation Status | Notes |
+| :--- | :--- | :--- |
+| **Dynamic Memory Tiering** | **Operational** | Pinned Host RAM (`VirtualAlloc` on Win, `mmap`/THP on Linux, UMA zero-copy on macOS Apple Silicon). |
+| **Paged KV Cache Management** | **Operational** | Block allocator with on-demand allocation, reference counting, and Radix tree prefix caching. |
+| **Transformer Forward Pass** | **Operational (CPU SIMD)** | Complete mathematical execution: Token Embedding -> RMSNorm -> QKV GEMV -> RoPE -> PagedAttention Dot-Product & Softmax -> Wo -> RMSNorm -> SwiGLU FFN -> LM Head Logits -> Sampling. |
+| **Continuous Batching Scheduler**| **Operational** | Chunked prefill scheduling and iteration-level decode loop in C ABI and Python runtime. |
+| **Quantization & SIMD Kernels** | **Operational** | AVX2+FMA (x86_64) and ARM NEON (ARM64) dequantization routines (INT4, FP8) and fused GEMV. |
+| **Model Formats** | **Parser Implemented** | Header parsers for GGUF and SafeTensors; synthetic normalized weight fallback for benchmarks/tests. |
+| **GPU Acceleration (CUDA/Metal)**| **Roadmap** | Currently executes via vectorized CPU SIMD and memory-mapped buffers; native CUDA/Metal kernels planned. |
+| **Distributed PD Disaggregation** | **Single-Node Prototype** | Queue-level decoupling of prefill and decode phases; multi-node RDMA network transport on roadmap. |
+
+---
+
+## Architecture & Core Design
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -32,13 +47,12 @@ Engineered for ultra-high concurrency and maximum throughput (tokens per second 
 ```
 
 ### 1. Dynamic Host RAM Parameter Tiering
-- **Conventional Engines (vLLM / SGLang)**: Require the entire model's weights to reside statically inside GPU VRAM, causing out-of-memory (OOM) failures or severely restricting KV cache capacity and batch size on smaller accelerators.
-- **NexusLLM Architecture**: Keeps inactive layers, weights, and inactive Mixture-of-Experts (MoE) parameters in **Host System RAM (Tier 1)**. Only the **active working set (Tier 0)** (the currently executing layer and top-k routed experts) is activated.
-- **Zero-Stall Asynchronous Pipeline**: Background prefetch worker threads stream upcoming layer parameters into double-buffered ping-pong working slots, overlapping PCIe/memory transfers with forward pass compute.
+- **Concept**: Rather than requiring the entirety of a model's weights to reside statically inside GPU VRAM, NexusLLM stages inactive parameters in **Host System RAM (Tier 1)**. Only the **active working set (Tier 0)** (the currently executing layer or top-k routed experts) is activated.
+- **Asynchronous Pipeline**: A background worker thread prefetches upcoming layer parameters into double-buffered working slots to overlap memory transfers with forward pass execution.
 
 ### 2. Native Multi-Platform Acceleration
-- **macOS (Apple Silicon M1–M4, Pro, Max, Ultra)**:
-  - **Zero-Copy Unified Memory Architecture (UMA)**: CPU and GPU share the same physical DRAM pool. Inactive parameters transition to active execution with zero memcpy overhead via direct pointer aliasing. MoE expert swap latency is effectively **0 ms**.
+- **macOS (Apple Silicon M1–M4)**:
+  - **Zero-Copy Unified Memory Architecture (UMA)**: CPU and GPU share the same physical DRAM pool. Inactive parameters transition to active execution with zero memcpy overhead via direct pointer aliasing.
   - **ARM NEON SIMD**: 128-bit vector dot-product acceleration (`vld1q_f32`, `vfmaq_f32`, `vaddvq_f32`) for INT4 and FP8 dequantization.
 - **Linux (Ubuntu, Debian, RHEL, CentOS, Rocky, Fedora, Arch, Alpine)**:
   - **Transparent Huge Pages (THP 2MB / 1GB)**: Managed via `mmap(MAP_PRIVATE | MAP_ANONYMOUS)` and `madvise(MADV_HUGEPAGE)` to minimize Translation Lookaside Buffer (TLB) misses across large weight pools.
@@ -49,21 +63,19 @@ Engineered for ultra-high concurrency and maximum throughput (tokens per second 
   - Pinned memory allocation through `VirtualAlloc(MEM_COMMIT | MEM_RESERVE)` and `VirtualLock`.
   - AVX2 and FMA 256-bit SIMD matrix-vector kernels (`_mm256_fmadd_ps`).
 
-### 3. Universal Model Loader (Accepts Almost All Formats)
-- **SafeTensors (`.safetensors`)**: Zero-copy JSON header deserialization with direct memory-mapped tensor slicing.
+### 3. Universal Model Loader
+- **SafeTensors (`.safetensors`)**: Header deserialization with direct memory-mapped tensor slicing.
 - **GGUF / GGML (`.gguf`)**: Binary parser for GGUF v2/v3 metadata, tensor tables, and quantized blocks (`Q4_0`, `Q4_K`, `Q8_0`, `F16`).
-- **PyTorch Checkpoints (`.pt`, `.bin`)**: Serialized state dict tensor streams.
+- **PyTorch Checkpoints (`.pt`, `.bin`)**: State dict tensor streams.
 - **ONNX (`.onnx`)**: Graph node weights and tensor manifests.
-- **Precision Support**: FP32, FP16, BF16, FP8 (E4M3), INT8 symmetric, and INT4 (AWQ, GPTQ).
 
-### 4. Advanced Serving Capabilities
+### 4. Serving Capabilities
 - **Radix Multi-Level Prefix Caching**: Automatically matches and reuses common prompt prefixes (system instructions, few-shot examples, multi-turn history) in $O(1)$ radix tree lookups.
-- **Speculative Multi-Token Verification**: Drafts and validates multiple candidate tokens per iteration step, achieving 2x–3.5x faster decode throughput.
-- **Disaggregated Prefill and Decode (PD Disaggregation)**: Decouples compute-bound prefill from memory-bandwidth-bound decode across distinct instances or execution queues (arXiv:2609.23130).
-- **Taxonomy-Grounded Bug Resilience**: Directly mitigates the 28 root causes identified across 929 real-world serving engine bugs (arXiv:2506.09713) with bounds-checked KV block allocators and atomic cancellation.
+- **Disaggregated Prefill and Decode (PD Pipeline)**: Decouples prefill scheduling from memory-bandwidth-bound decode across distinct execution queues.
+- **Bounds-Checked KV Block Allocator**: On-demand allocation with reference counting and atomic cancellation to avoid memory leaks.
 
-### 5. Genuine Transformer Forward Execution Pipeline
-- **Complete End-to-End Mathematical Computation**:
+### 5. Transformer Forward Execution Pipeline
+- **End-to-End Mathematical Computation**:
   - **Token Embedding Lookup**: Retrieves dense representations from embedding tables.
   - **RMSNorm (Root Mean Square Normalization)**: Numerically stable normalization before and after attention blocks.
   - **Q, K, V Matrix-Vector GEMV Projections**: Multi-head and Grouped-Query Attention (GQA) head projections.

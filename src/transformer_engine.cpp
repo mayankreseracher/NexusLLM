@@ -87,7 +87,10 @@ int32_t TransformerEngine::forward_token(
 
     // 1. Embedding lookup
     size_t safe_tok = static_cast<size_t>(std::abs(current_token)) % vocab_size_;
-    const float* emb_row = default_embed_table_.data() + (safe_tok * hidden_size_);
+    void* emb_raw = tier_mgr_ ? tier_mgr_->activate_parameter("token_embd.weight") : nullptr;
+    const float* emb_row = emb_raw ? 
+        (static_cast<const float*>(emb_raw) + (safe_tok * hidden_size_)) : 
+        (default_embed_table_.data() + (safe_tok * hidden_size_));
     std::memcpy(act_x_.data(), emb_row, hidden_size_ * sizeof(float));
 
     // 2. Multi-Layer Transformer Blocks
@@ -97,19 +100,30 @@ int32_t TransformerEngine::forward_token(
             tier_mgr_->prefetch_parameter_async("blk." + std::to_string(l + 1) + ".attn_q.weight");
         }
 
-        // Pointer offsets into layer weights
+        // Pointer offsets into layer weights or dynamically activated Tier 0 parameters
         const float* l_weights = default_layer_data_[l].data();
         size_t offset = 0;
 
-        const float* attn_norm = l_weights + offset; offset += hidden_size_;
-        const float* wq = l_weights + offset;        offset += (hidden_size_ * hidden_size_);
-        const float* wk = l_weights + offset;        offset += (num_kv_heads_ * head_dim_ * hidden_size_);
-        const float* wv = l_weights + offset;        offset += (num_kv_heads_ * head_dim_ * hidden_size_);
-        const float* wo = l_weights + offset;        offset += (hidden_size_ * hidden_size_);
-        const float* ffn_norm = l_weights + offset;  offset += hidden_size_;
-        const float* w_gate = l_weights + offset;    offset += (intermediate_size_ * hidden_size_);
-        const float* w_up = l_weights + offset;      offset += (intermediate_size_ * hidden_size_);
-        const float* w_down = l_weights + offset;
+        std::string pfx = "blk." + std::to_string(l) + ".";
+        void* attn_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_norm.weight") : nullptr;
+        void* wq_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_q.weight") : nullptr;
+        void* wk_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_k.weight") : nullptr;
+        void* wv_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_v.weight") : nullptr;
+        void* wo_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_output.weight") : nullptr;
+        void* ffn_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_norm.weight") : nullptr;
+        void* w_gate_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_gate.weight") : nullptr;
+        void* w_up_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_up.weight") : nullptr;
+        void* w_down_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_down.weight") : nullptr;
+
+        const float* attn_norm = attn_norm_raw ? static_cast<const float*>(attn_norm_raw) : (l_weights + offset); offset += hidden_size_;
+        const float* wq = wq_raw ? static_cast<const float*>(wq_raw) : (l_weights + offset);        offset += (hidden_size_ * hidden_size_);
+        const float* wk = wk_raw ? static_cast<const float*>(wk_raw) : (l_weights + offset);        offset += (num_kv_heads_ * head_dim_ * hidden_size_);
+        const float* wv = wv_raw ? static_cast<const float*>(wv_raw) : (l_weights + offset);        offset += (num_kv_heads_ * head_dim_ * hidden_size_);
+        const float* wo = wo_raw ? static_cast<const float*>(wo_raw) : (l_weights + offset);        offset += (hidden_size_ * hidden_size_);
+        const float* ffn_norm = ffn_norm_raw ? static_cast<const float*>(ffn_norm_raw) : (l_weights + offset);  offset += hidden_size_;
+        const float* w_gate = w_gate_raw ? static_cast<const float*>(w_gate_raw) : (l_weights + offset);    offset += (intermediate_size_ * hidden_size_);
+        const float* w_up = w_up_raw ? static_cast<const float*>(w_up_raw) : (l_weights + offset);      offset += (intermediate_size_ * hidden_size_);
+        const float* w_down = w_down_raw ? static_cast<const float*>(w_down_raw) : (l_weights + offset);
 
         // Pre-Attention RMSNorm
         TransformerOps::rmsnorm(act_x_.data(), attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
@@ -180,7 +194,9 @@ int32_t TransformerEngine::forward_token(
     TransformerOps::rmsnorm(act_x_.data(), nullptr, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
 
     // 4. LM Head / Logits Projection
-    TransformerOps::matmul_vec(default_lm_head_.data(), act_norm_.data(), act_logits_.data(), vocab_size_, hidden_size_);
+    void* head_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output.weight") : nullptr;
+    const float* lm_head = head_raw ? static_cast<const float*>(head_raw) : default_lm_head_.data();
+    TransformerOps::matmul_vec(lm_head, act_norm_.data(), act_logits_.data(), vocab_size_, hidden_size_);
 
     // 5. Sampling: select actual next token
     int32_t next_token = TransformerOps::sample_logits(act_logits_.data(), vocab_size_, temperature);
