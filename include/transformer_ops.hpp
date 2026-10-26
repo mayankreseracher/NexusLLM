@@ -2,6 +2,7 @@
 
 #include "nexus_common.hpp"
 #include "paged_cache.hpp"
+#include "quantization.hpp"
 #include <vector>
 #include <cmath>
 #include <cstring>
@@ -94,6 +95,21 @@ public:
                 sum += row[c] * x[c];
             }
             y[r] = sum;
+        }
+    }
+
+    // Matrix-Vector Multiplication supporting FP32, FP16, GGUF Q4_0, and GGUF Q8_0
+    static void matmul_vec_dispatch(const void* W, DataType dtype, const float* x, float* y, size_t rows, size_t cols) {
+        if (!W) return;
+        if (dtype == DataType::GGUF_Q4_0) {
+            QuantizationKernel::fused_gemv_q4_0(static_cast<const BlockQ4_0*>(W), x, y, rows, cols);
+        } else if (dtype == DataType::GGUF_Q8_0) {
+            QuantizationKernel::fused_gemv_q8_0(static_cast<const BlockQ8_0*>(W), x, y, rows, cols);
+        } else if (dtype == DataType::FP16) {
+            QuantizationKernel::fused_gemv_fp16(static_cast<const uint16_t*>(W), x, y, rows, cols);
+        } else {
+            // Default FP32
+            matmul_vec(static_cast<const float*>(W), x, y, rows, cols);
         }
     }
 

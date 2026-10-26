@@ -270,4 +270,152 @@ void QuantizationKernel::fused_gemv_fp8(const uint8_t* W_fp8,
     }
 }
 
+void QuantizationKernel::fused_gemv_q4_0(const BlockQ4_0* W_q4,
+                                        const float* x,
+                                        float* y,
+                                        size_t rows,
+                                        size_t cols) {
+    size_t num_blocks_per_row = cols / 32;
+
+    for (size_t r = 0; r < rows; ++r) {
+        const BlockQ4_0* row_blocks = W_q4 + (r * num_blocks_per_row);
+        float total_sum = 0.0f;
+
+        for (size_t b = 0; b < num_blocks_per_row; ++b) {
+            float d = fp16_to_fp32(row_blocks[b].d);
+            const uint8_t* qs = row_blocks[b].qs;
+            const float* x_block = x + (b * 32);
+            float block_sum = 0.0f;
+
+#if defined(NEXUS_HAVE_AVX2)
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+
+            alignas(32) float w_low[16];
+            alignas(32) float w_high[16];
+            for (size_t i = 0; i < 16; ++i) {
+                uint8_t byte = qs[i];
+                w_low[i] = static_cast<float>((byte & 0x0F) - 8);
+                w_high[i] = static_cast<float>((byte >> 4) - 8);
+            }
+
+            acc0 = _mm256_fmadd_ps(_mm256_load_ps(w_low), _mm256_loadu_ps(x_block), acc0);
+            acc0 = _mm256_fmadd_ps(_mm256_load_ps(w_low + 8), _mm256_loadu_ps(x_block + 8), acc0);
+
+            acc1 = _mm256_fmadd_ps(_mm256_load_ps(w_high), _mm256_loadu_ps(x_block + 16), acc1);
+            acc1 = _mm256_fmadd_ps(_mm256_load_ps(w_high + 8), _mm256_loadu_ps(x_block + 24), acc1);
+
+            __m256 acc = _mm256_add_ps(acc0, acc1);
+            alignas(32) float arr[8];
+            _mm256_store_ps(arr, acc);
+            block_sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+
+#elif defined(NEXUS_HAVE_ARM_NEON)
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            for (size_t i = 0; i < 16; i += 4) {
+                float w0[4], w1[4];
+                for (size_t k = 0; k < 4; ++k) {
+                    uint8_t byte = qs[i + k];
+                    w0[k] = static_cast<float>((byte & 0x0F) - 8);
+                    w1[k] = static_cast<float>((byte >> 4) - 8);
+                }
+                acc0 = vfmaq_f32(acc0, vld1q_f32(w0), vld1q_f32(x_block + i));
+                acc1 = vfmaq_f32(acc1, vld1q_f32(w1), vld1q_f32(x_block + 16 + i));
+            }
+            block_sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+#else
+            for (size_t i = 0; i < 16; ++i) {
+                uint8_t byte = qs[i];
+                block_sum += static_cast<float>((byte & 0x0F) - 8) * x_block[i];
+                block_sum += static_cast<float>((byte >> 4) - 8) * x_block[i + 16];
+            }
+#endif
+            total_sum += d * block_sum;
+        }
+
+        y[r] = total_sum;
+    }
+}
+
+void QuantizationKernel::fused_gemv_q8_0(const BlockQ8_0* W_q8,
+                                        const float* x,
+                                        float* y,
+                                        size_t rows,
+                                        size_t cols) {
+    size_t num_blocks_per_row = cols / 32;
+
+    for (size_t r = 0; r < rows; ++r) {
+        const BlockQ8_0* row_blocks = W_q8 + (r * num_blocks_per_row);
+        float total_sum = 0.0f;
+
+        for (size_t b = 0; b < num_blocks_per_row; ++b) {
+            float d = fp16_to_fp32(row_blocks[b].d);
+            const int8_t* qs = row_blocks[b].qs;
+            const float* x_block = x + (b * 32);
+            float block_sum = 0.0f;
+
+#if defined(NEXUS_HAVE_AVX2)
+            __m256 acc = _mm256_setzero_ps();
+            for (size_t i = 0; i < 32; i += 8) {
+                alignas(32) float w_f[8];
+                for (size_t k = 0; k < 8; ++k) {
+                    w_f[k] = static_cast<float>(qs[i + k]);
+                }
+                acc = _mm256_fmadd_ps(_mm256_load_ps(w_f), _mm256_loadu_ps(x_block + i), acc);
+            }
+            alignas(32) float arr[8];
+            _mm256_store_ps(arr, acc);
+            block_sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+#elif defined(NEXUS_HAVE_ARM_NEON)
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            for (size_t i = 0; i < 32; i += 4) {
+                float w_f[4];
+                for (size_t k = 0; k < 4; ++k) w_f[k] = static_cast<float>(qs[i + k]);
+                acc = vfmaq_f32(acc, vld1q_f32(w_f), vld1q_f32(x_block + i));
+            }
+            block_sum = vaddvq_f32(acc);
+#else
+            for (size_t i = 0; i < 32; ++i) {
+                block_sum += static_cast<float>(qs[i]) * x_block[i];
+            }
+#endif
+            total_sum += d * block_sum;
+        }
+
+        y[r] = total_sum;
+    }
+}
+
+void QuantizationKernel::fused_gemv_fp16(const uint16_t* W_fp16,
+                                        const float* x,
+                                        float* y,
+                                        size_t rows,
+                                        size_t cols) {
+    for (size_t r = 0; r < rows; ++r) {
+        const uint16_t* row = W_fp16 + (r * cols);
+        float sum = 0.0f;
+        size_t c = 0;
+
+#if defined(NEXUS_HAVE_AVX2)
+        __m256 v_acc = _mm256_setzero_ps();
+        for (; c + 8 <= cols; c += 8) {
+            alignas(32) float w_f[8];
+            for (size_t k = 0; k < 8; ++k) {
+                w_f[k] = fp16_to_fp32(row[c + k]);
+            }
+            v_acc = _mm256_fmadd_ps(_mm256_load_ps(w_f), _mm256_loadu_ps(x + c), v_acc);
+        }
+        alignas(32) float arr[8];
+        _mm256_store_ps(arr, v_acc);
+        sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+#endif
+
+        for (; c < cols; ++c) {
+            sum += fp16_to_fp32(row[c]) * x[c];
+        }
+        y[r] = sum;
+    }
+}
+
 } // namespace nexus

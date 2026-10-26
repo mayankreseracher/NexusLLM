@@ -10,6 +10,12 @@ struct BlockQ4_0 {
     uint8_t qs[16];    // 32 4-bit nibbles
 };
 
+// Quantization block for GGUF Q8_0: 32 values per block
+struct BlockQ8_0 {
+    uint16_t d;        // FP16 scale delta
+    int8_t qs[32];     // 32 signed 8-bit integers
+};
+
 // Quantization block for INT8: 32 values per block
 struct BlockINT8 {
     float scale;
@@ -67,6 +73,25 @@ public:
                               size_t rows, 
                               size_t cols, 
                               float weight_scale = 1.0f);
+
+    // GGUF Q4_0, Q8_0, and FP16 Fused GEMV kernels
+    static void fused_gemv_q4_0(const BlockQ4_0* W_q4,
+                                const float* x,
+                                float* y,
+                                size_t rows,
+                                size_t cols);
+
+    static void fused_gemv_q8_0(const BlockQ8_0* W_q8,
+                                const float* x,
+                                float* y,
+                                size_t rows,
+                                size_t cols);
+
+    static void fused_gemv_fp16(const uint16_t* W_fp16,
+                                const float* x,
+                                float* y,
+                                size_t rows,
+                                size_t cols);
 };
 
 } // namespace nexus
