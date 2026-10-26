@@ -74,6 +74,8 @@ private:
     
     void* tier0_raw_pool_ = nullptr;
     void* tier1_raw_pool_ = nullptr;
+    bool tier0_is_mmap_ = false;
+    bool tier1_is_mmap_ = false;
 
     size_t tier0_offset_ = 0;
     size_t tier1_offset_ = 0;

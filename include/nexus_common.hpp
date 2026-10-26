@@ -57,9 +57,11 @@
     #endif
 #elif defined(__x86_64__) || defined(_M_X64)
     #define NEXUS_ARCH_X86_64 1
-    #if !defined(NEXUS_NO_AVX2)
-        #define NEXUS_HAVE_AVX2 1
-        #include <immintrin.h>
+    #if (defined(__AVX2__) && defined(__FMA__)) || defined(_MSC_VER)
+        #if !defined(NEXUS_NO_AVX2)
+            #define NEXUS_HAVE_AVX2 1
+            #include <immintrin.h>
+        #endif
     #endif
 #endif
 
@@ -152,7 +154,9 @@ struct PlatformHardwareProfile {
             while (std::getline(os_release, line)) {
                 if (line.rfind("ID=", 0) == 0) {
                     std::string id = line.substr(3);
-                    if (!id.empty() && id.front() == '"') id = id.substr(1, id.size() - 2);
+                    if (id.size() >= 2 && id.front() == '"' && id.back() == '"') {
+                        id = id.substr(1, id.size() - 2);
+                    }
                     if (id == "ubuntu" || id == "debian") {
                         profile.os = OperatingSystem::OS_LINUX_UBUNTU_DEBIAN;
                         profile.os_name = (id == "ubuntu") ? "Ubuntu Linux" : "Debian GNU/Linux";

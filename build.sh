@@ -59,12 +59,12 @@ elif [ "$OS" = "Linux" ]; then
 fi
 
 # Select compiler
-if command -v clang++ >/dev/null 2>&1; then
-    CXX="clang++"
-elif command -v g++ >/dev/null 2>&1; then
+if command -v g++ >/dev/null 2>&1; then
     CXX="g++"
+elif command -v clang++ >/dev/null 2>&1; then
+    CXX="clang++"
 else
-    echo -e "\033[0;31m[Error] No C++ compiler (clang++ or g++) found in PATH.\033[0m"
+    echo -e "\033[0;31m[Error] No C++ compiler (g++ or clang++) found in PATH.\033[0m"
     exit 1
 fi
 
@@ -76,7 +76,8 @@ CXXFLAGS="-O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -pthread"
 if [ "$OS" = "Darwin" ]; then
     SHARED_OUT="libnexus_engine.dylib"
     LDFLAGS_SHARED="-dynamiclib"
-    LDFLAGS_BENCH="-L. -lnexus_engine"
+    LDFLAGS_LIBS=""
+    LDFLAGS_BENCH="-L. -lnexus_engine -Wl,-rpath,@loader_path"
     if [ "$ARCH" = "arm64" ]; then
         SIMD_FLAGS="-march=armv8.5-a"
     else
@@ -85,8 +86,9 @@ if [ "$OS" = "Darwin" ]; then
 else
     # Linux
     SHARED_OUT="libnexus_engine.so"
-    LDFLAGS_SHARED="-shared -ldl"
-    LDFLAGS_BENCH="-L. -lnexus_engine -ldl"
+    LDFLAGS_SHARED="-shared"
+    LDFLAGS_LIBS="-ldl -pthread"
+    LDFLAGS_BENCH="-L. -lnexus_engine -Wl,-rpath,\$ORIGIN"
     if [ "$ARCH" = "x86_64" ]; then
         SIMD_FLAGS="-mavx2 -mfma"
     elif [[ "$ARCH" =~ ^(aarch64|arm64) ]]; then
@@ -99,14 +101,14 @@ fi
 echo -e "${CYAN}[SIMD Config]${NC} Vector flags: ${BOLD}${SIMD_FLAGS:-None (Scalar Fallback)}${NC}"
 
 # Source files
-SOURCES="src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/nexus_engine.cpp src/nexus_abi.cpp"
+SOURCES="src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/transformer_engine.cpp src/nexus_engine.cpp src/nexus_abi.cpp"
 
 echo -e "\n${BOLD}[1/2] Compiling shared library: ${SHARED_OUT}...${NC}"
-$CXX $CXXFLAGS $SIMD_FLAGS $LDFLAGS_SHARED $SOURCES -o "$SHARED_OUT"
+$CXX $CXXFLAGS $SIMD_FLAGS $LDFLAGS_SHARED $SOURCES -o "$SHARED_OUT" $LDFLAGS_LIBS
 echo -e "${GREEN}✓ Successfully built ${SHARED_OUT}${NC}"
 
 echo -e "\n${BOLD}[2/2] Compiling benchmark executable: nexus_bench...${NC}"
-$CXX $CXXFLAGS $SIMD_FLAGS src/main_bench.cpp $LDFLAGS_BENCH -o nexus_bench
+$CXX $CXXFLAGS $SIMD_FLAGS src/main_bench.cpp $LDFLAGS_BENCH -o nexus_bench $LDFLAGS_LIBS
 echo -e "${GREEN}✓ Successfully built nexus_bench${NC}"
 
 echo -e "\n${BOLD}${GREEN}================================================================${NC}"
@@ -116,4 +118,4 @@ echo -e "Shared Library : ${BOLD}${SHARED_OUT}${NC}"
 echo -e "CLI Benchmark  : ${BOLD}./nexus_bench${NC}"
 echo -e "Python Module  : ${BOLD}python -m pip install -e .${NC} or import directly."
 echo -e ""
-echo -e "To run the benchmark now: ${BOLD}LD_LIBRARY_PATH=. ./nexus_bench${NC} (or ${BOLD}DYLD_LIBRARY_PATH=. ./nexus_bench${NC} on macOS)"
+echo -e "To run the benchmark now: ${BOLD}./nexus_bench${NC}"

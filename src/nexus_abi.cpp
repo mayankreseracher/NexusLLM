@@ -6,6 +6,7 @@
 #include "paged_cache.hpp"
 #include "quantization.hpp"
 #include "disaggregated_pipeline.hpp"
+#include "transformer_engine.hpp"
 
 namespace nexus {
     class EngineContext;
@@ -17,14 +18,16 @@ public:
     InternalEngine(size_t t0, size_t t1, size_t max_kv) {
         tier_mgr = std::make_shared<nexus::MemoryTierManager>(t0, t1);
         loader = std::make_unique<nexus::UniversalModelLoader>(tier_mgr);
-        kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(max_kv, 32, 32, 128);
+        kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(max_kv, 4, 4, 64);
         control_plane = std::make_unique<nexus::DisaggregatedControlPlane>(kv_mgr);
+        transformer = std::make_unique<nexus::TransformerEngine>(tier_mgr, kv_mgr, loader->get_metadata());
     }
 
     std::shared_ptr<nexus::MemoryTierManager> tier_mgr;
     std::unique_ptr<nexus::UniversalModelLoader> loader;
     std::shared_ptr<nexus::PagedKVCacheManager> kv_mgr;
     std::unique_ptr<nexus::DisaggregatedControlPlane> control_plane;
+    std::unique_ptr<nexus::TransformerEngine> transformer;
 };
 
 extern "C" {
@@ -61,7 +64,13 @@ NEXUS_API void nexus_get_platform_info(NexusPlatformInfo* out_info) {
 NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* filepath) {
     if (!engine || !filepath) return -1;
     auto* eng = static_cast<InternalEngine*>(engine);
-    return static_cast<int32_t>(eng->loader->load_model(filepath));
+    auto status = eng->loader->load_model(filepath);
+    if (status == nexus::NexusStatus::SUCCESS) {
+        eng->transformer = std::make_unique<nexus::TransformerEngine>(
+            eng->tier_mgr, eng->kv_mgr, eng->loader->get_metadata()
+        );
+    }
+    return static_cast<int32_t>(status);
 }
 
 NEXUS_API int32_t nexus_get_loaded_tensor_count(NexusEngineHandle engine) {
@@ -122,22 +131,53 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
     if (!engine) return 0;
     auto* eng = static_cast<InternalEngine*>(engine);
 
-    // 1. Process chunked prefill
+    // 1. Process chunked prefill via full transformer forward pass
     auto prefill_batch = eng->control_plane->schedule_prefill_batch(1024);
     for (auto& req : prefill_batch) {
         if (req->processed_tokens >= req->prompt_tokens.size()) {
-            eng->control_plane->complete_prefill_and_handoff(req, 100); // first token
+            int32_t first_token = eng->transformer->forward_prefill(
+                req->prompt_tokens,
+                req->assigned_block_ids,
+                req->temperature
+            );
+            eng->control_plane->complete_prefill_and_handoff(req, first_token);
         }
     }
 
-    // 2. Process decode batch
+    // 2. Process decode batch via full transformer forward pass
     auto decode_batch = eng->control_plane->schedule_decode_batch(max_out);
     int32_t step_count = 0;
 
     for (size_t i = 0; i < decode_batch.size() && static_cast<size_t>(step_count) < max_out; ++i) {
         auto& req = decode_batch[i];
-        int32_t next_token = 1000 + static_cast<int32_t>(req->generated_tokens.size());
-        bool is_eos = (req->generated_tokens.size() + 1 >= req->max_new_tokens);
+        if (req->is_finished) continue;
+
+        int32_t last_token = req->generated_tokens.empty() ? 
+            (req->prompt_tokens.empty() ? 1 : req->prompt_tokens.back()) :
+            req->generated_tokens.back();
+
+        size_t current_pos = req->prompt_tokens.size() + req->generated_tokens.size();
+
+        // Ensure dynamic PagedAttention block allocation if sequence crosses block boundary
+        size_t needed_block_idx = current_pos / nexus::BLOCK_SIZE;
+        while (needed_block_idx >= req->assigned_block_ids.size()) {
+            auto new_blocks = eng->kv_mgr->allocate_blocks(1);
+            if (!new_blocks.empty()) {
+                req->assigned_block_ids.push_back(new_blocks[0]);
+            } else {
+                break;
+            }
+        }
+
+        // Run genuine full Transformer forward pass (Embedding -> RMSNorm -> QKV -> RoPE -> PagedAttn -> Wo -> RMSNorm -> SwiGLU -> Logits -> Sample)
+        int32_t next_token = eng->transformer->forward_token(
+            last_token,
+            current_pos,
+            req->assigned_block_ids,
+            req->temperature
+        );
+
+        bool is_eos = (next_token == 2 || (req->max_new_tokens > 0 && req->generated_tokens.size() >= req->max_new_tokens));
         eng->control_plane->step_decode_token(req, next_token, is_eos);
 
         if (out_tokens) out_tokens[step_count] = next_token;

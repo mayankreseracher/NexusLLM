@@ -17,12 +17,22 @@ struct KVBlock {
     float* key_data = nullptr;
     float* value_data = nullptr;
     size_t tokens_occupied = 0;
+    std::vector<float> storage;
 
     KVBlock() = default;
     KVBlock(const KVBlock&) = default;
     KVBlock& operator=(const KVBlock&) = default;
     KVBlock(KVBlock&&) noexcept = default;
     KVBlock& operator=(KVBlock&&) noexcept = default;
+
+    void ensure_allocated(size_t num_layers, size_t num_heads, size_t head_dim) {
+        size_t half_stride = num_layers * num_heads * BLOCK_SIZE * head_dim;
+        if (storage.size() < 2 * half_stride) {
+            storage.resize(2 * half_stride, 0.0f);
+        }
+        key_data = storage.data();
+        value_data = storage.data() + half_stride;
+    }
 
     void reset() {
         ref_count = 0;
@@ -69,6 +79,10 @@ public:
     size_t get_free_blocks_count() const;
     size_t get_total_blocks_count() const { return max_blocks_; }
     double get_prefix_hit_rate() const;
+
+    size_t get_num_layers() const { return num_layers_; }
+    size_t get_num_heads() const { return num_heads_; }
+    size_t get_head_dim() const { return head_dim_; }
 
 private:
     size_t max_blocks_;

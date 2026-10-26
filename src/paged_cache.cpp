@@ -15,7 +15,6 @@ PagedKVCacheManager::PagedKVCacheManager(size_t max_blocks, size_t num_layers, s
         block_pool_[i].block_id = static_cast<int32_t>(i);
         block_pool_[i].ref_count = 0;
         block_pool_[i].tokens_occupied = 0;
-        // In a real accelerator, these pointers point to device memory or pinned host pages
         block_pool_[i].key_data = nullptr;
         block_pool_[i].value_data = nullptr;
         free_block_indices_.push_back(static_cast<int32_t>(i));
@@ -44,6 +43,7 @@ std::vector<int32_t> PagedKVCacheManager::allocate_blocks(size_t num_blocks_need
         KVBlock& blk = block_pool_[blk_id];
         blk.ref_count = 1;
         blk.tokens_occupied = 0;
+        blk.ensure_allocated(num_layers_, num_heads_, head_dim_);
         blk.last_accessed_timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 

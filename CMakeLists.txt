@@ -40,6 +40,7 @@ add_library(nexus_engine SHARED
     src/paged_cache.cpp
     src/quantization.cpp
     src/moe_router.cpp
+    src/transformer_engine.cpp
     src/nexus_engine.cpp
     src/nexus_abi.cpp
 )
@@ -53,3 +54,15 @@ endif()
 # Standalone benchmark executable
 add_executable(nexus_bench src/main_bench.cpp)
 target_link_libraries(nexus_bench PRIVATE nexus_engine)
+
+if(APPLE)
+    set_target_properties(nexus_bench PROPERTIES
+        BUILD_RPATH "@loader_path"
+        INSTALL_RPATH "@loader_path"
+    )
+elseif(UNIX)
+    set_target_properties(nexus_bench PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+    )
+endif()

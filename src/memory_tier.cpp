@@ -14,31 +14,43 @@ MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_c
     tier0_raw_pool_ = VirtualAlloc(NULL, tier0_capacity_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     // Allocate Tier 1 (Host System RAM) for full model weights / inactive parameter residency
     tier1_raw_pool_ = VirtualAlloc(NULL, tier1_capacity_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#elif defined(NEXUS_PLATFORM_MACOS)
-    // macOS POSIX anonymous mapping (Zero-copy unified memory backing)
+#elif defined(NEXUS_PLATFORM_MACOS) || defined(NEXUS_PLATFORM_LINUX)
+#if defined(NEXUS_PLATFORM_MACOS)
     tier0_raw_pool_ = mmap(NULL, tier0_capacity_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     tier1_raw_pool_ = mmap(NULL, tier1_capacity_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (tier0_raw_pool_ == MAP_FAILED) tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
-    if (tier1_raw_pool_ == MAP_FAILED) tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
-#elif defined(NEXUS_PLATFORM_LINUX)
-    // Linux Transparent Huge Pages (THP) allocation via mmap & madvise
+#else
     tier0_raw_pool_ = mmap(NULL, tier0_capacity_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     tier1_raw_pool_ = mmap(NULL, tier1_capacity_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (tier0_raw_pool_ == MAP_FAILED) tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
-    if (tier1_raw_pool_ == MAP_FAILED) tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
+#endif
+
+    if (tier0_raw_pool_ != MAP_FAILED && tier0_raw_pool_ != nullptr) {
+        tier0_is_mmap_ = true;
+    } else {
+        size_t sz = (tier0_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
+        tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz);
+        tier0_is_mmap_ = false;
+    }
+
+    if (tier1_raw_pool_ != MAP_FAILED && tier1_raw_pool_ != nullptr) {
+        tier1_is_mmap_ = true;
+    } else {
+        size_t sz = (tier1_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
+        tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz);
+        tier1_is_mmap_ = false;
+    }
 
 #if defined(MADV_HUGEPAGE)
-    if (tier0_raw_pool_ != MAP_FAILED) {
-        madvise(tier0_raw_pool_, tier0_capacity_, MADV_HUGEPAGE);
-    }
-    if (tier1_raw_pool_ != MAP_FAILED) {
-        madvise(tier1_raw_pool_, tier1_capacity_, MADV_HUGEPAGE);
-    }
+    if (tier0_is_mmap_) madvise(tier0_raw_pool_, tier0_capacity_, MADV_HUGEPAGE);
+    if (tier1_is_mmap_) madvise(tier1_raw_pool_, tier1_capacity_, MADV_HUGEPAGE);
 #endif
 
 #else
-    tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier0_capacity_);
-    tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, tier1_capacity_);
+    size_t sz0 = (tier0_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
+    size_t sz1 = (tier1_capacity_ + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
+    tier0_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz0);
+    tier1_raw_pool_ = aligned_alloc(NEXUS_ALIGNMENT, sz1);
+    tier0_is_mmap_ = false;
+    tier1_is_mmap_ = false;
 #endif
 
     stats_.tier0_capacity_bytes = tier0_capacity_;
@@ -68,8 +80,14 @@ MemoryTierManager::~MemoryTierManager() {
     if (tier0_raw_pool_) VirtualFree(tier0_raw_pool_, 0, MEM_RELEASE);
     if (tier1_raw_pool_) VirtualFree(tier1_raw_pool_, 0, MEM_RELEASE);
 #elif defined(NEXUS_PLATFORM_POSIX)
-    if (tier0_raw_pool_ && tier0_raw_pool_ != MAP_FAILED) munmap(tier0_raw_pool_, tier0_capacity_);
-    if (tier1_raw_pool_ && tier1_raw_pool_ != MAP_FAILED) munmap(tier1_raw_pool_, tier1_capacity_);
+    if (tier0_raw_pool_ && tier0_raw_pool_ != MAP_FAILED) {
+        if (tier0_is_mmap_) munmap(tier0_raw_pool_, tier0_capacity_);
+        else free(tier0_raw_pool_);
+    }
+    if (tier1_raw_pool_ && tier1_raw_pool_ != MAP_FAILED) {
+        if (tier1_is_mmap_) munmap(tier1_raw_pool_, tier1_capacity_);
+        else free(tier1_raw_pool_);
+    }
 #else
     if (tier0_raw_pool_) free(tier0_raw_pool_);
     if (tier1_raw_pool_) free(tier1_raw_pool_);
@@ -175,7 +193,12 @@ NexusStatus MemoryTierManager::prefetch_parameter_async(const std::string& name)
         std::lock_guard<std::mutex> lock(registry_mutex_);
         auto it = registry_.find(name);
         if (it != registry_.end() && it->second->host_ptr) {
-            madvise(it->second->host_ptr, it->second->byte_size, MADV_WILLNEED);
+            long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size <= 0) page_size = 4096;
+            uintptr_t addr = reinterpret_cast<uintptr_t>(it->second->host_ptr);
+            uintptr_t aligned_addr = addr & ~(page_size - 1);
+            size_t aligned_len = ((addr + it->second->byte_size + page_size - 1) & ~(page_size - 1)) - aligned_addr;
+            madvise(reinterpret_cast<void*>(aligned_addr), aligned_len, MADV_WILLNEED);
         }
     }
 #endif
@@ -200,7 +223,12 @@ NexusStatus MemoryTierManager::deactivate_parameter(const std::string& name) {
 
 #if defined(NEXUS_PLATFORM_POSIX) && defined(MADV_COLD)
         if (tv->host_ptr) {
-            madvise(tv->host_ptr, tv->byte_size, MADV_COLD);
+            long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size <= 0) page_size = 4096;
+            uintptr_t addr = reinterpret_cast<uintptr_t>(tv->host_ptr);
+            uintptr_t aligned_addr = addr & ~(page_size - 1);
+            size_t aligned_len = ((addr + tv->byte_size + page_size - 1) & ~(page_size - 1)) - aligned_addr;
+            madvise(reinterpret_cast<void*>(aligned_addr), aligned_len, MADV_COLD);
         }
 #endif
 

@@ -55,9 +55,13 @@ jobs:
       - name: Run C++ Native Benchmark (POSIX)
         if: runner.os != 'Windows'
         run: |
-          ./nexus_bench
+          LD_LIBRARY_PATH=. DYLD_LIBRARY_PATH=. ./nexus_bench
 
-      # Run Python Test Suite
+      # Install Python Package & Run Test Suite
+      - name: Install Python Package
+        run: |
+          pip install -e .
+
       - name: Run Python Unit Tests
         run: |
           python -m unittest discover -s tests

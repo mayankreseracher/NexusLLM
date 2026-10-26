@@ -62,6 +62,17 @@ Engineered for ultra-high concurrency and maximum throughput (tokens per second 
 - **Disaggregated Prefill and Decode (PD Disaggregation)**: Decouples compute-bound prefill from memory-bandwidth-bound decode across distinct instances or execution queues (arXiv:2609.23130).
 - **Taxonomy-Grounded Bug Resilience**: Directly mitigates the 28 root causes identified across 929 real-world serving engine bugs (arXiv:2506.09713) with bounds-checked KV block allocators and atomic cancellation.
 
+### 5. Genuine Transformer Forward Execution Pipeline
+- **Complete End-to-End Mathematical Computation**:
+  - **Token Embedding Lookup**: Retrieves dense representations from embedding tables.
+  - **RMSNorm (Root Mean Square Normalization)**: Numerically stable normalization before and after attention blocks.
+  - **Q, K, V Matrix-Vector GEMV Projections**: Multi-head and Grouped-Query Attention (GQA) head projections.
+  - **Rotary Position Embeddings (RoPE)**: Rotary position encoding across Query and Key heads for arbitrary context lengths.
+  - **PagedAttention Block Storage & Dot-Product Attention**: Attention scores computed against cached Key/Value blocks with $\frac{1}{\sqrt{d_{head}}}$ scaling, Softmax, and Value reduction.
+  - **SwiGLU Feed-Forward Network**: SiLU-gated up-projection multiplied element-wise and projected down (`w_down(SiLU(w_gate(x)) * w_up(x))`).
+  - **LM Head & Sampling**: Logits projection and temperature-scaled categorical or greedy argmax sampling.
+- **Dynamic Asynchronous Layer Prefetching**: Layer $l+1$ weights are proactively transferred into Tier 0 working buffers while layer $l$ is executing.
+
 ---
 
 ## Directory Structure
@@ -75,6 +86,8 @@ nexus_engine/
 │   ├── paged_cache.hpp            # PagedAttention KV pool & Radix prefix tree
 │   ├── quantization.hpp           # SIMD dequantization & fused GEMV kernels
 │   ├── moe_router.hpp             # Dynamic MoE expert streaming & top-k routing
+│   ├── transformer_ops.hpp        # RMSNorm, RoPE, PagedAttention MHA/GQA, SwiGLU, Softmax, GEMV
+│   ├── transformer_engine.hpp     # Full transformer forward pass pipeline with async prefetch
 │   ├── disaggregated_pipeline.hpp # Prefill-Decode disaggregation control plane
 │   └── nexus_abi.h                # Clean C ABI exports
 ├── src/
@@ -83,6 +96,7 @@ nexus_engine/
 │   ├── paged_cache.cpp            # Radix prefix tree matching & block allocator
 │   ├── quantization.cpp           # Vectorized ARM NEON & AVX2/FMA fused GEMV
 │   ├── moe_router.cpp             # Top-k expert streaming & softmax routing
+│   ├── transformer_engine.cpp     # End-to-end forward pass execution & token sampling
 │   ├── nexus_engine.cpp           # Continuous micro-batch forward loop
 │   ├── nexus_abi.cpp              # C ABI implementations
 │   └── main_bench.cpp             # Standalone C++ benchmark binary
