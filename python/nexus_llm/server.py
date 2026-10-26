@@ -129,16 +129,41 @@ async def chat_completions(req: ChatCompletionRequest):
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+@app.get("/v1/platform")
+async def get_platform_info():
+    caps = native_engine.get_platform_capabilities()
+    return {
+        "os_name": caps.os_name,
+        "cpu_arch": caps.cpu_arch,
+        "vector_isa": caps.vector_isa,
+        "is_unified_memory": caps.is_unified_memory,
+        "has_transparent_hugepages": caps.has_transparent_hugepages,
+        "hardware_concurrency": caps.hardware_concurrency,
+        "theoretical_bandwidth_gbps": caps.theoretical_bandwidth_gbps,
+        "performance_tier_description": caps.performance_tier_desc
+    }
+
 @app.get("/v1/health")
 @app.get("/v1/status")
 async def get_engine_status():
     t_stats = native_engine.get_local_stats()
     m_stats = memory_mgr.get_stats()
     b_stats = batcher.get_throughput_stats()
+    caps = native_engine.get_platform_capabilities()
 
     return {
         "engine_status": "ONLINE",
         "privacy": "100% AIR-GAPPED / ZERO-TELEMETRY / ZERO PHONE-HOME",
+        "platform_capabilities": {
+            "os_name": caps.os_name,
+            "cpu_arch": caps.cpu_arch,
+            "vector_isa": caps.vector_isa,
+            "is_unified_memory": caps.is_unified_memory,
+            "has_transparent_hugepages": caps.has_transparent_hugepages,
+            "hardware_concurrency": caps.hardware_concurrency,
+            "theoretical_bandwidth_gbps": caps.theoretical_bandwidth_gbps,
+            "performance_tier_description": caps.performance_tier_desc
+        },
         "memory_tiering": {
             "active_accelerator_working_set_mb": m_stats["tier0_allocated_mb"],
             "host_ram_inactive_weights_mb": m_stats["tier1_inactive_mb"],

@@ -17,9 +17,42 @@ namespace NexusInfer
         public double PrefixCacheHitRate;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct NexusPlatformInfoRaw
+    {
+        public uint OsType;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string OsName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string CpuArch;
+        public uint VectorIsa;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string VectorIsaName;
+        public uint IsUnifiedMemory;
+        public uint HasTransparentHugepages;
+        public uint HardwareConcurrency;
+        public double TheoreticalBandwidthGbps;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string PerformanceTierDesc;
+    }
+
+    public class PlatformCapabilities
+    {
+        public string OsName { get; set; }
+        public string CpuArch { get; set; }
+        public string VectorIsaName { get; set; }
+        public bool IsUnifiedMemory { get; set; }
+        public bool HasTransparentHugepages { get; set; }
+        public uint HardwareConcurrency { get; set; }
+        public double TheoreticalBandwidthGbps { get; set; }
+        public string PerformanceTierDesc { get; set; }
+    }
+
     public class NexusEngineInstance : IDisposable
     {
-        private const string LibName = "nexus_engine.dll";
+        // On .NET Core / .NET 6+, "nexus_engine" dynamically resolves to
+        // nexus_engine.dll on Windows, libnexus_engine.so on Linux, and libnexus_engine.dylib on macOS.
+        private const string LibName = "nexus_engine";
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr nexus_create_engine(ulong tier0Bytes, ulong tier1Bytes, ulong maxKvBlocks);
@@ -28,10 +61,16 @@ namespace NexusInfer
         private static extern void nexus_destroy_engine(IntPtr engine);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void nexus_get_platform_info(ref NexusPlatformInfoRaw outInfo);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int nexus_load_model_auto(IntPtr engine, [MarshalAs(UnmanagedType.LPStr)] string filepath);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int nexus_prefetch_layer(IntPtr engine, [MarshalAs(UnmanagedType.LPStr)] string layerName);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int nexus_deactivate_layer(IntPtr engine, [MarshalAs(UnmanagedType.LPStr)] string layerName);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int nexus_submit_request(
@@ -66,6 +105,23 @@ namespace NexusInfer
             }
         }
 
+        public static PlatformCapabilities GetPlatformCapabilities()
+        {
+            NexusPlatformInfoRaw raw = new NexusPlatformInfoRaw();
+            nexus_get_platform_info(ref raw);
+            return new PlatformCapabilities
+            {
+                OsName = raw.OsName,
+                CpuArch = raw.CpuArch,
+                VectorIsaName = raw.VectorIsaName,
+                IsUnifiedMemory = raw.IsUnifiedMemory != 0,
+                HasTransparentHugepages = raw.HasTransparentHugepages != 0,
+                HardwareConcurrency = raw.HardwareConcurrency,
+                TheoreticalBandwidthGbps = raw.TheoreticalBandwidthGbps,
+                PerformanceTierDesc = raw.PerformanceTierDesc
+            };
+        }
+
         public bool LoadModel(string modelPath)
         {
             return nexus_load_model_auto(_handle, modelPath) == 0;
@@ -74,6 +130,11 @@ namespace NexusInfer
         public bool PrefetchLayer(string layerName)
         {
             return nexus_prefetch_layer(_handle, layerName) == 0;
+        }
+
+        public bool DeactivateLayer(string layerName)
+        {
+            return nexus_deactivate_layer(_handle, layerName) == 0;
         }
 
         public bool SubmitRequest(string requestId, int[] promptTokens, ulong maxNewTokens = 128)
@@ -100,12 +161,6 @@ namespace NexusInfer
                 nexus_destroy_engine(_handle);
                 _handle = IntPtr.Zero;
             }
-            GC.SuppressFinalize(this);
-        }
-
-        ~NexusEngineInstance()
-        {
-            Dispose();
         }
     }
 }

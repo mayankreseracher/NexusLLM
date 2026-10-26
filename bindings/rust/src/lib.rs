@@ -18,9 +18,54 @@ pub struct NexusLocalMemoryStats {
     pub prefix_cache_hit_rate: f64,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NexusPlatformInfoRaw {
+    pub os_type: u32,
+    pub os_name: [c_char; 64],
+    pub cpu_arch: [c_char; 32],
+    pub vector_isa: u32,
+    pub vector_isa_name: [c_char; 32],
+    pub is_unified_memory: u32,
+    pub has_transparent_hugepages: u32,
+    pub hardware_concurrency: u32,
+    pub theoretical_bandwidth_gbps: f64,
+    pub performance_tier_desc: [c_char; 128],
+}
+
+impl Default for NexusPlatformInfoRaw {
+    fn default() -> Self {
+        Self {
+            os_type: 0,
+            os_name: [0; 64],
+            cpu_arch: [0; 32],
+            vector_isa: 0,
+            vector_isa_name: [0; 32],
+            is_unified_memory: 0,
+            has_transparent_hugepages: 0,
+            hardware_concurrency: 1,
+            theoretical_bandwidth_gbps: 0.0,
+            performance_tier_desc: [0; 128],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PlatformCapabilities {
+    pub os_name: String,
+    pub cpu_arch: String,
+    pub vector_isa_name: String,
+    pub is_unified_memory: bool,
+    pub has_transparent_hugepages: bool,
+    pub hardware_concurrency: u32,
+    pub theoretical_bandwidth_gbps: f64,
+    pub performance_tier_desc: String,
+}
+
 extern "C" {
     fn nexus_create_engine(tier0_bytes: usize, tier1_bytes: usize, max_kv_blocks: usize) -> *mut c_void;
     fn nexus_destroy_engine(engine: *mut c_void);
+    fn nexus_get_platform_info(out_info: *mut NexusPlatformInfoRaw);
     fn nexus_load_model_auto(engine: *mut c_void, filepath: *const c_char) -> i32;
     fn nexus_prefetch_layer(engine: *mut c_void, layer_name: *const c_char) -> i32;
     fn nexus_deactivate_layer(engine: *mut c_void, layer_name: *const c_char) -> i32;
@@ -55,6 +100,31 @@ impl NexusEngine {
             Err("Failed to create NexusEngine instance")
         } else {
             Ok(Self { handle })
+        }
+    }
+
+    /// Retrieve detected platform capabilities across macOS, Linux, and Windows
+    pub fn get_platform_capabilities() -> PlatformCapabilities {
+        let mut raw = NexusPlatformInfoRaw::default();
+        unsafe { nexus_get_platform_info(&mut raw) };
+
+        let to_str = |buf: &[c_char]| -> String {
+            unsafe {
+                CStr::from_ptr(buf.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+
+        PlatformCapabilities {
+            os_name: to_str(&raw.os_name),
+            cpu_arch: to_str(&raw.cpu_arch),
+            vector_isa_name: to_str(&raw.vector_isa_name),
+            is_unified_memory: raw.is_unified_memory != 0,
+            has_transparent_hugepages: raw.has_transparent_hugepages != 0,
+            hardware_concurrency: raw.hardware_concurrency,
+            theoretical_bandwidth_gbps: raw.theoretical_bandwidth_gbps,
+            performance_tier_desc: to_str(&raw.performance_tier_desc),
         }
     }
 
