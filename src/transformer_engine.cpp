@@ -185,9 +185,9 @@ int32_t TransformerEngine::forward_token(
 
     // 2. Multi-Layer Transformer Blocks
     for (size_t l = 0; l < num_layers_; ++l) {
-        // Dynamic Tiering Prefetch: trigger async prefetch for layer l+1
+        // Dynamic Tiering Overlapped Double-Buffering: trigger async prefetch for entire layer l+1
         if (l + 1 < num_layers_ && tier_mgr_) {
-            tier_mgr_->prefetch_parameter_async("blk." + std::to_string(l + 1) + ".attn_q.weight");
+            tier_mgr_->prefetch_layer_async(l + 1);
         }
 
         // Pointer offsets into layer weights or dynamically activated Tier 0 parameters
@@ -322,10 +322,9 @@ int32_t TransformerEngine::forward_token(
             act_x_[i] += act_down_[i];
         }
 
-        // Dynamic layer deactivation: evict active working buffers to maintain small Tier 0 footprint
+        // Dynamic layer deactivation & double-buffer slot rotation
         if (tier_mgr_) {
-            tier_mgr_->deactivate_parameter(pfx + "attn_q.weight");
-            tier_mgr_->deactivate_parameter(pfx + "ffn_gate.weight");
+            tier_mgr_->deactivate_layer(l);
         }
     }
 

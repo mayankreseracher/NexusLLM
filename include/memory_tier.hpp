@@ -24,8 +24,10 @@ struct WorkingBufferSlot {
     void* buffer_ptr = nullptr;
     size_t capacity_bytes = 0;
     size_t used_bytes = 0;
+    int32_t active_layer_idx = -1;
     std::string current_layer_id;
-    bool is_ready = false;
+    std::vector<std::string> slot_tensors;
+    std::atomic<bool> is_ready{false};
     std::atomic<bool> in_use{false};
 };
 
@@ -52,8 +54,17 @@ public:
     // Predictive asynchronous prefetch: Start loading parameter into Tier 0 before needed
     NexusStatus prefetch_parameter_async(const std::string& name);
 
+    // Prefetch all parameters of a layer into alternating double buffer slot
+    NexusStatus prefetch_layer_async(size_t layer_idx);
+
     // Evict parameter back to inactive state in Tier 1 RAM
     NexusStatus deactivate_parameter(const std::string& name);
+
+    // Deactivate all parameters of a layer and rotate double buffer slot
+    NexusStatus deactivate_layer(size_t layer_idx);
+
+    // Helper: list canonical tensor names for a layer index
+    std::vector<std::string> get_layer_tensor_names(size_t layer_idx) const;
 
     // Pin-pong buffer rotation for sequential transformer layer execution
     WorkingBufferSlot* acquire_active_slot(size_t required_bytes);

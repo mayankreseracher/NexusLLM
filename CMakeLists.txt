@@ -43,6 +43,7 @@ add_library(nexus_engine SHARED
     src/transformer_engine.cpp
     src/nexus_engine.cpp
     src/nexus_abi.cpp
+    src/nexus_backend.cpp
 )
 
 target_include_directories(nexus_engine PUBLIC include)

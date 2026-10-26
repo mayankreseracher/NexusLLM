@@ -180,15 +180,19 @@ void* MemoryTierManager::activate_parameter(const std::string& name) {
     WorkingBufferSlot* slot = acquire_active_slot(tv->byte_size);
     if (!slot) return nullptr;
 
+    size_t aligned_req = (tv->byte_size + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
+    void* dest_ptr = static_cast<char*>(slot->buffer_ptr) + (slot->used_bytes - aligned_req);
+
     auto t0 = std::chrono::high_resolution_clock::now();
-    std::memcpy(slot->buffer_ptr, tv->host_ptr, tv->byte_size);
+    std::memcpy(dest_ptr, tv->host_ptr, tv->byte_size);
     auto t1 = std::chrono::high_resolution_clock::now();
     double copy_time_s = std::chrono::duration<double>(t1 - t0).count();
 
-    tv->active_ptr = slot->buffer_ptr;
+    tv->active_ptr = dest_ptr;
     tv->is_active = true;
     tv->current_tier = MemoryTier::TIER0_ACTIVE_WORKING_SET;
     slot->current_layer_id = name;
+    slot->slot_tensors.push_back(name);
 
     {
         std::lock_guard<std::mutex> sl(stats_mutex_);
@@ -259,36 +263,35 @@ NexusStatus MemoryTierManager::deactivate_parameter(const std::string& name) {
 }
 
 WorkingBufferSlot* MemoryTierManager::acquire_active_slot(size_t required_bytes) {
-    // Acquire slot in round-robin ping-pong fashion
-    for (size_t attempt = 0; attempt < NUM_WORKING_SLOTS; ++attempt) {
-        size_t idx = current_slot_idx_ % NUM_WORKING_SLOTS;
-        current_slot_idx_++;
+    size_t aligned_req = (required_bytes + NEXUS_ALIGNMENT - 1) & ~(NEXUS_ALIGNMENT - 1);
 
-        if (!working_slots_[idx].in_use.load() && working_slots_[idx].capacity_bytes >= required_bytes) {
-            working_slots_[idx].in_use.store(true);
-            working_slots_[idx].used_bytes = required_bytes;
-            return &working_slots_[idx];
-        }
+    // Try packing into the current active slot first
+    size_t cur = current_slot_idx_ % NUM_WORKING_SLOTS;
+    if (working_slots_[cur].capacity_bytes >= working_slots_[cur].used_bytes + aligned_req) {
+        working_slots_[cur].in_use.store(true);
+        working_slots_[cur].used_bytes += aligned_req;
+        return &working_slots_[cur];
     }
 
-    // Ping-pong double-buffering rotation: recycle next slot
-    size_t idx = current_slot_idx_ % NUM_WORKING_SLOTS;
+    // Ping-pong double-buffering rotation: advance to next alternating slot
     current_slot_idx_++;
-    if (working_slots_[idx].capacity_bytes >= required_bytes) {
-        if (!working_slots_[idx].current_layer_id.empty()) {
-            auto it = registry_.find(working_slots_[idx].current_layer_id);
+    size_t next = current_slot_idx_ % NUM_WORKING_SLOTS;
+
+    // Reset previous contents in this slot
+    if (!working_slots_[next].slot_tensors.empty()) {
+        for (const auto& t_name : working_slots_[next].slot_tensors) {
+            auto it = registry_.find(t_name);
             if (it != registry_.end()) {
                 it->second->is_active = false;
                 it->second->active_ptr = nullptr;
                 it->second->current_tier = MemoryTier::TIER1_HOST_SYSTEM_RAM;
             }
         }
-        working_slots_[idx].in_use.store(true);
-        working_slots_[idx].used_bytes = required_bytes;
-        return &working_slots_[idx];
+        working_slots_[next].slot_tensors.clear();
     }
-
-    return nullptr;
+    working_slots_[next].used_bytes = aligned_req;
+    working_slots_[next].in_use.store(true);
+    return &working_slots_[next];
 }
 
 void MemoryTierManager::release_active_slot(WorkingBufferSlot* slot) {
@@ -296,7 +299,40 @@ void MemoryTierManager::release_active_slot(WorkingBufferSlot* slot) {
         slot->in_use.store(false);
         slot->used_bytes = 0;
         slot->current_layer_id.clear();
+        slot->slot_tensors.clear();
+        slot->is_ready.store(false);
     }
+}
+
+std::vector<std::string> MemoryTierManager::get_layer_tensor_names(size_t layer_idx) const {
+    std::string pfx = "blk." + std::to_string(layer_idx) + ".";
+    return {
+        pfx + "attn_norm.weight",
+        pfx + "attn_q.weight",
+        pfx + "attn_k.weight",
+        pfx + "attn_v.weight",
+        pfx + "attn_output.weight",
+        pfx + "ffn_norm.weight",
+        pfx + "ffn_gate.weight",
+        pfx + "ffn_up.weight",
+        pfx + "ffn_down.weight"
+    };
+}
+
+NexusStatus MemoryTierManager::prefetch_layer_async(size_t layer_idx) {
+    auto names = get_layer_tensor_names(layer_idx);
+    for (const auto& name : names) {
+        prefetch_parameter_async(name);
+    }
+    return NexusStatus::SUCCESS;
+}
+
+NexusStatus MemoryTierManager::deactivate_layer(size_t layer_idx) {
+    auto names = get_layer_tensor_names(layer_idx);
+    for (const auto& name : names) {
+        deactivate_parameter(name);
+    }
+    return NexusStatus::SUCCESS;
 }
 
 void MemoryTierManager::prefetch_worker_loop() {

@@ -46,12 +46,34 @@ typedef struct {
     char performance_tier_desc[128];
 } NexusPlatformInfo;
 
+typedef struct {
+    uint32_t device_type;       // 0=CPU, 1=CUDA, 2=Apple Silicon Metal, 3=AMD ROCm, 4=Intel Arc SYCL, 5=OpenCL
+    char device_name[64];
+    char vendor[64];
+    char architecture[32];
+    uint32_t is_unified_memory;
+    uint32_t supports_fp16;
+    uint32_t supports_int4;
+    char driver_version[64];
+    char description[128];
+} NexusDeviceInfo;
+
 // Lifecycle
 NEXUS_API NexusEngineHandle nexus_create_engine(size_t tier0_bytes, size_t tier1_bytes, size_t max_kv_blocks);
 NEXUS_API void nexus_destroy_engine(NexusEngineHandle engine);
 
 // Platform & Hardware Capability Discovery
 NEXUS_API void nexus_get_platform_info(NexusPlatformInfo* out_info);
+
+// Hardware Accelerator Backend Management (Phase 5: CUDA, Apple Silicon Metal/CuMetal, AMD ROCm, Intel Arc SYCL)
+NEXUS_API uint32_t nexus_get_available_device_count(void);
+NEXUS_API int32_t nexus_get_device_info(uint32_t device_idx, NexusDeviceInfo* out_info);
+NEXUS_API int32_t nexus_set_compute_device(NexusEngineHandle engine, const char* device_name);
+NEXUS_API const char* nexus_get_active_device_name(NexusEngineHandle engine);
+
+// Overlapped Double-Buffering Layer Prefetch (Phase 4)
+NEXUS_API int32_t nexus_prefetch_layer_index(NexusEngineHandle engine, uint32_t layer_idx);
+NEXUS_API int32_t nexus_deactivate_layer_index(NexusEngineHandle engine, uint32_t layer_idx);
 
 // Model loading
 NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* filepath);

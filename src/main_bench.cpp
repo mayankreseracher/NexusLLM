@@ -12,6 +12,7 @@ int main(int argc, char** argv) {
     std::cout << "================================================================" << std::endl;
 
     std::string model_path = "";
+    std::string device_name = "";
     size_t num_requests = 16;
     size_t prompt_len = 128;
     size_t gen_len = 64;
@@ -20,6 +21,8 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) {
             model_path = argv[++i];
+        } else if (arg == "--device" && i + 1 < argc) {
+            device_name = argv[++i];
         } else if (arg == "--requests" && i + 1 < argc) {
             num_requests = std::stoull(argv[++i]);
         } else if (arg == "--prompt" && i + 1 < argc) {
@@ -27,7 +30,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--gen" && i + 1 < argc) {
             gen_len = std::stoull(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [--model <path.gguf>] [--requests <N>] [--prompt <len>] [--gen <len>]" << std::endl;
+            std::cout << "Usage: " << argv[0] << " [--model <path.gguf>] [--device <cpu|cuda|metal|rocm|sycl>] [--requests <N>] [--prompt <len>] [--gen <len>]" << std::endl;
             return 0;
         }
     }
@@ -55,6 +58,22 @@ int main(int argc, char** argv) {
     std::cout << "[Platform HW]  Hardware Concurrency   : " << pinfo.hardware_concurrency << " threads" << std::endl;
     std::cout << "[Platform HW]  Theoretical Peak BW    : " << pinfo.theoretical_bandwidth_gbps << " GB/s" << std::endl;
     std::cout << "[Platform HW]  Performance Profile    : " << pinfo.performance_tier_desc << std::endl;
+    std::cout << "----------------------------------------------------------------" << std::endl;
+
+    // Phase 5 Hardware Backend Discovery
+    uint32_t dev_count = nexus_get_available_device_count();
+    std::cout << "[Hardware Devices] Detected " << dev_count << " Compute Acceleration Interfaces:" << std::endl;
+    for (uint32_t d = 0; d < dev_count; ++d) {
+        NexusDeviceInfo dinfo;
+        if (nexus_get_device_info(d, &dinfo) == 0) {
+            std::cout << "  - [" << dinfo.device_name << "] (" << dinfo.vendor << ", " << dinfo.architecture << "): " << dinfo.description << std::endl;
+        }
+    }
+
+    if (!device_name.empty()) {
+        nexus_set_compute_device(engine, device_name.c_str());
+    }
+    std::cout << "[Compute Engine] Active Compute Backend : " << nexus_get_active_device_name(engine) << std::endl;
     std::cout << "----------------------------------------------------------------" << std::endl;
 
     if (!model_path.empty()) {

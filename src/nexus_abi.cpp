@@ -7,6 +7,7 @@
 #include "quantization.hpp"
 #include "disaggregated_pipeline.hpp"
 #include "transformer_engine.hpp"
+#include "nexus_backend.hpp"
 
 namespace nexus {
     class EngineContext;
@@ -21,6 +22,7 @@ public:
         kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(max_kv, 4, 4, 64);
         control_plane = std::make_unique<nexus::DisaggregatedControlPlane>(kv_mgr);
         transformer = std::make_unique<nexus::TransformerEngine>(tier_mgr, kv_mgr, loader->get_metadata());
+        backend = nexus::BackendRegistry::instance().create_default_backend();
     }
 
     std::shared_ptr<nexus::MemoryTierManager> tier_mgr;
@@ -28,6 +30,7 @@ public:
     std::shared_ptr<nexus::PagedKVCacheManager> kv_mgr;
     std::unique_ptr<nexus::DisaggregatedControlPlane> control_plane;
     std::unique_ptr<nexus::TransformerEngine> transformer;
+    std::shared_ptr<nexus::INexusComputeBackend> backend;
 };
 
 extern "C" {
@@ -59,6 +62,60 @@ NEXUS_API void nexus_get_platform_info(NexusPlatformInfo* out_info) {
     out_info->theoretical_bandwidth_gbps = profile.theoretical_bandwidth_gbps;
     std::strncpy(out_info->performance_tier_desc, profile.performance_tier_description.c_str(), sizeof(out_info->performance_tier_desc) - 1);
     out_info->performance_tier_desc[sizeof(out_info->performance_tier_desc) - 1] = '\0';
+}
+
+NEXUS_API uint32_t nexus_get_available_device_count(void) {
+    return static_cast<uint32_t>(nexus::BackendRegistry::instance().get_available_devices().size());
+}
+
+NEXUS_API int32_t nexus_get_device_info(uint32_t device_idx, NexusDeviceInfo* out_info) {
+    if (!out_info) return -1;
+    auto devices = nexus::BackendRegistry::instance().get_available_devices();
+    if (device_idx >= devices.size()) return -1;
+
+    const auto& d = devices[device_idx];
+    out_info->device_type = static_cast<uint32_t>(d.type);
+    std::strncpy(out_info->device_name, d.device_name.c_str(), sizeof(out_info->device_name) - 1);
+    out_info->device_name[sizeof(out_info->device_name) - 1] = '\0';
+    std::strncpy(out_info->vendor, d.vendor.c_str(), sizeof(out_info->vendor) - 1);
+    out_info->vendor[sizeof(out_info->vendor) - 1] = '\0';
+    std::strncpy(out_info->architecture, d.architecture.c_str(), sizeof(out_info->architecture) - 1);
+    out_info->architecture[sizeof(out_info->architecture) - 1] = '\0';
+    out_info->is_unified_memory = d.is_unified_memory ? 1 : 0;
+    out_info->supports_fp16 = d.supports_fp16 ? 1 : 0;
+    out_info->supports_int4 = d.supports_int4 ? 1 : 0;
+    std::strncpy(out_info->driver_version, d.driver_version.c_str(), sizeof(out_info->driver_version) - 1);
+    out_info->driver_version[sizeof(out_info->driver_version) - 1] = '\0';
+    std::strncpy(out_info->description, d.description.c_str(), sizeof(out_info->description) - 1);
+    out_info->description[sizeof(out_info->description) - 1] = '\0';
+    return 0;
+}
+
+NEXUS_API int32_t nexus_set_compute_device(NexusEngineHandle engine, const char* device_name) {
+    if (!engine || !device_name) return -1;
+    auto* eng = static_cast<InternalEngine*>(engine);
+    auto dev_type = nexus::BackendRegistry::parse_device_type(device_name);
+    eng->backend = nexus::BackendRegistry::instance().create_backend(dev_type);
+    return 0;
+}
+
+NEXUS_API const char* nexus_get_active_device_name(NexusEngineHandle engine) {
+    if (!engine) return "None";
+    auto* eng = static_cast<InternalEngine*>(engine);
+    if (!eng->backend) return "None";
+    return eng->backend->get_capabilities().device_name.c_str();
+}
+
+NEXUS_API int32_t nexus_prefetch_layer_index(NexusEngineHandle engine, uint32_t layer_idx) {
+    if (!engine) return -1;
+    auto* eng = static_cast<InternalEngine*>(engine);
+    return static_cast<int32_t>(eng->tier_mgr->prefetch_layer_async(layer_idx));
+}
+
+NEXUS_API int32_t nexus_deactivate_layer_index(NexusEngineHandle engine, uint32_t layer_idx) {
+    if (!engine) return -1;
+    auto* eng = static_cast<InternalEngine*>(engine);
+    return static_cast<int32_t>(eng->tier_mgr->deactivate_layer(layer_idx));
 }
 
 NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* filepath) {

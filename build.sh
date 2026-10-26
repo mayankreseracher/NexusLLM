@@ -101,7 +101,7 @@ fi
 echo -e "${CYAN}[SIMD Config]${NC} Vector flags: ${BOLD}${SIMD_FLAGS:-None (Scalar Fallback)}${NC}"
 
 # Source files
-SOURCES="src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/transformer_engine.cpp src/nexus_engine.cpp src/nexus_abi.cpp"
+SOURCES="src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/transformer_engine.cpp src/nexus_engine.cpp src/nexus_abi.cpp src/nexus_backend.cpp"
 
 echo -e "\n${BOLD}[1/2] Compiling shared library: ${SHARED_OUT}...${NC}"
 $CXX $CXXFLAGS $SIMD_FLAGS $LDFLAGS_SHARED $SOURCES -o "$SHARED_OUT" $LDFLAGS_LIBS

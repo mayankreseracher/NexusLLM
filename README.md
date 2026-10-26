@@ -11,12 +11,13 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 | Subsystem / Capability | Current Implementation Status | Notes |
 | :--- | :--- | :--- |
 | **Dynamic Memory Tiering** | **Operational** | Pinned Host RAM (`VirtualAlloc` on Win, `mmap`/THP on Linux, UMA zero-copy on macOS Apple Silicon). |
+| **Double-Buffered Overlap (Phase 4)**| **Operational** | Ping-pong layer slots with asynchronous background worker prefetching layer $l+1$ while layer $l$ computes. |
 | **Paged KV Cache Management** | **Operational** | Block allocator with on-demand allocation, reference counting, and Radix tree prefix caching. |
-| **Transformer Forward Pass** | **Operational (CPU SIMD)** | Complete mathematical execution: Token Embedding -> RMSNorm -> QKV GEMV -> RoPE -> PagedAttention Dot-Product & Softmax -> Wo -> RMSNorm -> SwiGLU FFN -> LM Head Logits -> Sampling. |
+| **Transformer Forward Pass** | **Operational** | Complete mathematical execution: Token Embedding -> RMSNorm -> QKV GEMV -> RoPE -> PagedAttention Dot-Product & Softmax -> Wo -> RMSNorm -> SwiGLU FFN -> LM Head Logits -> Sampling. |
 | **Continuous Batching Scheduler**| **Operational** | Chunked prefill scheduling and iteration-level decode loop in C ABI and Python runtime. |
-| **Quantization & SIMD Kernels** | **Operational** | AVX2+FMA (x86_64) and ARM NEON (ARM64) dequantization routines (INT4, FP8) and fused GEMV. |
-| **Model Formats** | **Parser Implemented** | Header parsers for GGUF and SafeTensors; synthetic normalized weight fallback for benchmarks/tests. |
-| **GPU Acceleration (CUDA/Metal)**| **Roadmap** | Currently executes via vectorized CPU SIMD and memory-mapped buffers; native CUDA/Metal kernels planned. |
+| **Quantization & SIMD Kernels** | **Operational** | Fused quantized GEMV for GGUF Q4_0, Q8_0, FP16 via AVX2+FMA (x86_64) and ARM NEON (ARM64). |
+| **Model Formats (Phase 3)** | **Operational** | Zero-copy binary memory mapping of `.gguf` v2/v3 files directly into Host RAM with full metadata extraction. |
+| **Hardware Backends (Phase 5)** | **Operational & Extensible** | Multi-device abstraction: NVIDIA CUDA, Apple Silicon Metal (with [CuMetal](https://github.com/Lulzx/cuda-metal) translation layer), AMD ROCm/HIP, Intel Arc oneAPI/SYCL, CPU SIMD fallback. |
 | **Distributed PD Disaggregation** | **Single-Node Prototype** | Queue-level decoupling of prefill and decode phases; multi-node RDMA network transport on roadmap. |
 
 ---
@@ -83,7 +84,15 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
   - **PagedAttention Block Storage & Dot-Product Attention**: Attention scores computed against cached Key/Value blocks with $\frac{1}{\sqrt{d_{head}}}$ scaling, Softmax, and Value reduction.
   - **SwiGLU Feed-Forward Network**: SiLU-gated up-projection multiplied element-wise and projected down (`w_down(SiLU(w_gate(x)) * w_up(x))`).
   - **LM Head & Sampling**: Logits projection and temperature-scaled categorical or greedy argmax sampling.
-- **Dynamic Asynchronous Layer Prefetching**: Layer $l+1$ weights are proactively transferred into Tier 0 working buffers while layer $l$ is executing.
+- **Dynamic Asynchronous Layer Prefetching**: Layer $l+1$ weights are proactively transferred into Tier 0 working buffers while layer $l$ is executing via alternating double-buffered ping-pong working slots.
+
+### 6. Hardware Accelerator Backends (Phase 5)
+NexusLLM features a modular hardware device abstraction (`INexusComputeBackend` and `BackendRegistry`) providing runtime hardware discovery and unified kernel dispatch:
+- **NVIDIA CUDA**: Probes CUDA driver/runtime dynamically (`nvcuda.dll` / `libcuda.so`), sets up CUDA streams, asynchronous device allocation, and Tensor Core GEMV dispatch.
+- **Apple Silicon Metal**: Tailored for Apple Silicon M-series (M1-M4) Unified Memory Architecture (zero-copy DRAM access). Integrates the [CuMetal (Lulzx/cuda-metal)](https://github.com/Lulzx/cuda-metal) translation bridge, allowing CUDA kernel code and PTX to transpile directly into Metal Shading Language (MSL) compute pipelines.
+- **AMD ROCm / HIP**: Probes AMD HIP runtime (`amdhip64.dll` / `libamdhip64.so`) for Radeon and Instinct GPUs.
+- **Intel Arc oneAPI / SYCL**: Probes Intel Level Zero (`ze_loader.dll` / `libze_loader.so`) and SYCL USM for Intel Arc / Xe matrix compute.
+- **CPU SIMD Fallback**: Highly optimized AVX2+FMA (x86_64) and ARM NEON (AArch64) fused quantized GEMV and PagedAttention kernels.
 
 ---
 
@@ -93,8 +102,9 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 nexus_engine/
 ├── include/
 │   ├── nexus_common.hpp           # Platform detection, aligned types, hardware profiles
+│   ├── nexus_backend.hpp          # Hardware compute backends (CUDA, Metal, ROCm, SYCL, CPU)
 │   ├── memory_tier.hpp            # Tier 0 (Active) vs Tier 1 (Host RAM) manager
-│   ├── model_loader.hpp           # SafeTensors, GGUF, PyTorch, ONNX parsers
+│   ├── model_loader.hpp           # SafeTensors, GGUF v2/v3 zero-copy mmap parsers
 │   ├── paged_cache.hpp            # PagedAttention KV pool & Radix prefix tree
 │   ├── quantization.hpp           # SIMD dequantization & fused GEMV kernels
 │   ├── moe_router.hpp             # Dynamic MoE expert streaming & top-k routing
@@ -104,7 +114,8 @@ nexus_engine/
 │   └── nexus_abi.h                # Clean C ABI exports
 ├── src/
 │   ├── memory_tier.cpp            # UMA zero-copy, Linux THP mmap, and VirtualAlloc
-│   ├── model_loader.cpp           # SafeTensors & GGUF binary parsers
+│   ├── nexus_backend.cpp          # Backend implementations & dynamic device registry
+│   ├── model_loader.cpp           # SafeTensors & GGUF zero-copy memory-mapped loader
 │   ├── paged_cache.cpp            # Radix prefix tree matching & block allocator
 │   ├── quantization.cpp           # Vectorized ARM NEON & AVX2/FMA fused GEMV
 │   ├── moe_router.cpp             # Top-k expert streaming & softmax routing
