@@ -375,4 +375,14 @@ TensorView* MemoryTierManager::get_tensor_view(const std::string& name) {
     return (it != registry_.end()) ? it->second.get() : nullptr;
 }
 
+void MemoryTierManager::clear_registry() {
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+    registry_.clear();
+    tier1_offset_ = 0;
+    tier0_offset_ = 0;
+    std::lock_guard<std::mutex> sl(stats_mutex_);
+    stats_.tier1_inactive_bytes = 0;
+    stats_.tier0_allocated_bytes = 0;
+}
+
 } // namespace nexus

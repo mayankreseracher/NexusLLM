@@ -8,7 +8,7 @@ from pathlib import Path
 repo_root = Path(__file__).resolve().parent.parent
 dll_path = repo_root / "nexus_engine.dll"
 
-def write_gguf_v3_file(filepath: str, hidden_size: int = 64, num_layers: int = 2, vocab_size: int = 256):
+def write_gguf_v3_file(filepath: str, hidden_size: int = 64, num_layers: int = 2, vocab_size: int = 256, extra_tensors: list = None, exclude_tensors: list = None):
     """Generates a valid binary GGUF v3 file with real quantized and float weights."""
     intermediate_size = hidden_size * 2
     head_dim = hidden_size // 2
@@ -83,6 +83,12 @@ def write_gguf_v3_file(filepath: str, hidden_size: int = 64, num_layers: int = 2
 
     head_data = b"\x00" * (vocab_size * hidden_size * 4)
     tensors.append(("output.weight", [hidden_size, vocab_size], 0, head_data))
+
+    if extra_tensors:
+        tensors.extend(extra_tensors)
+
+    if exclude_tensors:
+        tensors = [t for t in tensors if t[0] not in exclude_tensors]
 
     with open(filepath, "wb") as f:
         # Header
@@ -178,6 +184,12 @@ class TestGGUFBinaryMMap(unittest.TestCase):
         self.lib.nexus_step_continuous_batch.restype = ctypes.c_int32
         self.lib.nexus_step_continuous_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
 
+        self.lib.nexus_get_active_buffer.restype = ctypes.c_void_p
+        self.lib.nexus_get_active_buffer.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+        self.lib.nexus_forward_token.restype = ctypes.c_int32
+        self.lib.nexus_forward_token.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_size_t, ctypes.c_float]
+
     def tearDown(self):
         if os.path.exists(self.temp_path):
             try:
@@ -210,6 +222,95 @@ class TestGGUFBinaryMMap(unittest.TestCase):
         self.assertGreaterEqual(stepped, 1, "Expected at least 1 token generated")
 
         self.lib.nexus_destroy_engine(engine)
+
+    def test_canonical_tensor_aliases(self):
+        """Verifies that GGUF blk.{l}.* tensors are mapped and accessible via canonical keys layers.{l}.*"""
+        engine = self.lib.nexus_create_engine(64 * 1024 * 1024, 256 * 1024 * 1024, 128)
+        self.assertIsNotNone(engine)
+
+        status = self.lib.nexus_load_model_auto(engine, self.temp_path.encode("utf-8"))
+        self.assertEqual(status, 0)
+
+        canonical_keys = [
+            b"token_embd",
+            b"lm_head",
+            b"output_norm",
+            b"layers.0.wq",
+            b"layers.0.wk",
+            b"layers.0.wv",
+            b"layers.0.wo",
+            b"layers.0.ffn_gate",
+            b"layers.0.ffn_up",
+            b"layers.0.ffn_down",
+            b"layers.0.attn_norm",
+            b"layers.0.ffn_norm",
+            b"layers.1.wq",
+            b"layers.1.wk",
+            b"layers.1.wv",
+            b"layers.1.wo",
+            b"layers.1.ffn_gate",
+            b"layers.1.ffn_up",
+            b"layers.1.ffn_down",
+            b"layers.1.attn_norm",
+            b"layers.1.ffn_norm",
+        ]
+        for key in canonical_keys:
+            buf = self.lib.nexus_get_active_buffer(engine, key)
+            self.assertIsNotNone(buf, f"Canonical key '{key.decode()}' was not registered in tier manager!")
+
+        self.lib.nexus_destroy_engine(engine)
+
+    def test_mtp_tensor_registration(self):
+        """Verifies that MTP / Medusa auxiliary heads are registered and alias-mapped."""
+        temp_mtp = tempfile.NamedTemporaryFile(suffix=".gguf", delete=False)
+        temp_mtp_path = temp_mtp.name
+        temp_mtp.close()
+
+        try:
+            write_gguf_v3_file(temp_mtp_path, hidden_size=64, num_layers=2, vocab_size=256, extra_tensors=[
+                ("mtp_head.0.weight", [64, 256], 0, b"\x00" * (256 * 64 * 4)),
+                ("blk.0.mtp_head.1.weight", [64, 256], 0, b"\x00" * (256 * 64 * 4))
+            ])
+
+            engine = self.lib.nexus_create_engine(64 * 1024 * 1024, 256 * 1024 * 1024, 128)
+            status = self.lib.nexus_load_model_auto(engine, temp_mtp_path.encode("utf-8"))
+            self.assertEqual(status, 0)
+
+            # Both mtp.0.weight and mtp_head.0.weight should be reachable
+            b1 = self.lib.nexus_get_active_buffer(engine, b"mtp.0.weight")
+            b2 = self.lib.nexus_get_active_buffer(engine, b"mtp_head.0.weight")
+            self.assertIsNotNone(b1, "mtp.0.weight was not reachable")
+            self.assertIsNotNone(b2, "mtp_head.0.weight was not reachable")
+
+            self.lib.nexus_destroy_engine(engine)
+        finally:
+            if os.path.exists(temp_mtp_path):
+                os.remove(temp_mtp_path)
+
+    def test_missing_tensor_hard_fail(self):
+        """Verifies that if a required weight is missing in a loaded model, forward pass fails hard with -4 (NEXUS_ERR_MISSING_TENSOR)."""
+        temp_broken = tempfile.NamedTemporaryFile(suffix=".gguf", delete=False)
+        temp_broken_path = temp_broken.name
+        temp_broken.close()
+        engine = None
+
+        try:
+            write_gguf_v3_file(temp_broken_path, hidden_size=64, num_layers=2, vocab_size=256, exclude_tensors=["blk.0.attn_q.weight"])
+
+            engine = self.lib.nexus_create_engine(64 * 1024 * 1024, 256 * 1024 * 1024, 128)
+            status = self.lib.nexus_load_model_auto(engine, temp_broken_path.encode("utf-8"))
+            self.assertEqual(status, 0)
+
+            ret = self.lib.nexus_forward_token(engine, 10, 0, 0.0)
+            self.assertEqual(ret, -4, f"Expected NEXUS_ERR_MISSING_TENSOR (-4), got {ret}")
+        finally:
+            if engine:
+                self.lib.nexus_destroy_engine(engine)
+            if os.path.exists(temp_broken_path):
+                try:
+                    os.remove(temp_broken_path)
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     unittest.main()

@@ -122,6 +122,7 @@ private:
     // Default weight storage if not loaded from disk
     std::vector<float> default_embed_table_;
     std::vector<float> default_lm_head_;
+    std::vector<float> default_out_norm_;
     std::vector<std::vector<float>> default_layer_data_;
     bool weights_ready_ = false;
 };

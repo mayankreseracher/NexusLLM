@@ -58,6 +58,11 @@ typedef struct {
     char description[128];
 } NexusDeviceInfo;
 
+// Error codes
+#ifndef __cplusplus
+#define NEXUS_ERR_MISSING_TENSOR -4
+#endif
+
 // Lifecycle
 NEXUS_API NexusEngineHandle nexus_create_engine(size_t tier0_bytes, size_t tier1_bytes, size_t max_kv_blocks);
 NEXUS_API void nexus_destroy_engine(NexusEngineHandle engine);

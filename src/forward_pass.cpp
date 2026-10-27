@@ -57,8 +57,11 @@ void ForwardPassExecutor::initialize_default_weights() {
 
     // Check if parameters already registered by loader or previous instance
     if (tier_mgr_ && (tier_mgr_->get_tensor_view("output.weight") != nullptr ||
+                      tier_mgr_->get_tensor_view("lm_head") != nullptr ||
                       tier_mgr_->get_tensor_view("token_embd.weight") != nullptr ||
-                      tier_mgr_->get_tensor_view("blk.0.attn_q.weight") != nullptr)) {
+                      tier_mgr_->get_tensor_view("token_embd") != nullptr ||
+                      tier_mgr_->get_tensor_view("blk.0.attn_q.weight") != nullptr ||
+                      tier_mgr_->get_tensor_view("layers.0.wq") != nullptr)) {
         weights_initialized_ = true;
         return;
     }
@@ -100,54 +103,67 @@ void ForwardPassExecutor::initialize_default_weights() {
         TensorShape emb_shape;
         emb_shape.dims = { vocab_size_, hidden_size_ };
         tier_mgr_->register_parameter("token_embd.weight", DataType::FP32, emb_shape, default_embed_.data());
+        tier_mgr_->register_parameter("token_embd", DataType::FP32, emb_shape, default_embed_.data());
 
         TensorShape head_shape;
         head_shape.dims = { vocab_size_, hidden_size_ };
         tier_mgr_->register_parameter("output.weight", DataType::FP32, head_shape, default_lm_head_.data());
+        tier_mgr_->register_parameter("lm_head", DataType::FP32, head_shape, default_lm_head_.data());
 
         TensorShape out_norm_shape;
         out_norm_shape.dims = { hidden_size_ };
         tier_mgr_->register_parameter("output_norm.weight", DataType::FP32, out_norm_shape, default_out_norm_.data());
+        tier_mgr_->register_parameter("output_norm", DataType::FP32, out_norm_shape, default_out_norm_.data());
 
         for (size_t l = 0; l < num_layers_; ++l) {
             std::string pfx = "blk." + std::to_string(l) + ".";
+            std::string canon_pfx = "layers." + std::to_string(l) + ".";
             const float* lw = default_layer_data_[l].data();
             size_t off = 0;
 
             TensorShape norm_shape; norm_shape.dims = { hidden_size_ };
             tier_mgr_->register_parameter(pfx + "attn_norm.weight", DataType::FP32, norm_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "attn_norm", DataType::FP32, norm_shape, lw + off);
             off += hidden_size_;
 
             TensorShape q_shape; q_shape.dims = { num_heads_ * head_dim_, hidden_size_ };
             tier_mgr_->register_parameter(pfx + "attn_q.weight", DataType::FP32, q_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "wq", DataType::FP32, q_shape, lw + off);
             off += (hidden_size_ * hidden_size_);
 
             TensorShape k_shape; k_shape.dims = { num_kv_heads_ * head_dim_, hidden_size_ };
             tier_mgr_->register_parameter(pfx + "attn_k.weight", DataType::FP32, k_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "wk", DataType::FP32, k_shape, lw + off);
             off += (num_kv_heads_ * head_dim_ * hidden_size_);
 
             TensorShape v_shape; v_shape.dims = { num_kv_heads_ * head_dim_, hidden_size_ };
             tier_mgr_->register_parameter(pfx + "attn_v.weight", DataType::FP32, v_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "wv", DataType::FP32, v_shape, lw + off);
             off += (num_kv_heads_ * head_dim_ * hidden_size_);
 
             TensorShape o_shape; o_shape.dims = { hidden_size_, hidden_size_ };
             tier_mgr_->register_parameter(pfx + "attn_output.weight", DataType::FP32, o_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "wo", DataType::FP32, o_shape, lw + off);
             off += (hidden_size_ * hidden_size_);
 
             TensorShape ffn_norm_shape; ffn_norm_shape.dims = { hidden_size_ };
             tier_mgr_->register_parameter(pfx + "ffn_norm.weight", DataType::FP32, ffn_norm_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "ffn_norm", DataType::FP32, ffn_norm_shape, lw + off);
             off += hidden_size_;
 
             TensorShape gate_shape; gate_shape.dims = { intermediate_size_, hidden_size_ };
             tier_mgr_->register_parameter(pfx + "ffn_gate.weight", DataType::FP32, gate_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "ffn_gate", DataType::FP32, gate_shape, lw + off);
             off += (intermediate_size_ * hidden_size_);
 
             TensorShape up_shape; up_shape.dims = { intermediate_size_, hidden_size_ };
             tier_mgr_->register_parameter(pfx + "ffn_up.weight", DataType::FP32, up_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "ffn_up", DataType::FP32, up_shape, lw + off);
             off += (intermediate_size_ * hidden_size_);
 
             TensorShape down_shape; down_shape.dims = { hidden_size_, intermediate_size_ };
             tier_mgr_->register_parameter(pfx + "ffn_down.weight", DataType::FP32, down_shape, lw + off);
+            tier_mgr_->register_parameter(canon_pfx + "ffn_down", DataType::FP32, down_shape, lw + off);
         }
     }
 
@@ -313,12 +329,33 @@ int32_t ForwardPassExecutor::forward_token(
 ) {
     if (block_table.empty()) return 0;
 
+    auto get_param = [&](const std::string& key1, const std::string& key2 = "", const std::string& key3 = "") -> void* {
+        if (!tier_mgr_) return nullptr;
+        void* ptr = tier_mgr_->activate_parameter(key1);
+        if (!ptr && !key2.empty()) ptr = tier_mgr_->activate_parameter(key2);
+        if (!ptr && !key3.empty()) ptr = tier_mgr_->activate_parameter(key3);
+        return ptr;
+    };
+
+    auto get_view = [&](const std::string& key1, const std::string& key2 = "", const std::string& key3 = "") -> TensorView* {
+        if (!tier_mgr_) return nullptr;
+        TensorView* tv = tier_mgr_->get_tensor_view(key1);
+        if (!tv && !key2.empty()) tv = tier_mgr_->get_tensor_view(key2);
+        if (!tv && !key3.empty()) tv = tier_mgr_->get_tensor_view(key3);
+        return tv;
+    };
+
     // 1. Embedding lookup: hidden = embed(tokens)
-    TensorView* tv_emb = tier_mgr_ ? tier_mgr_->get_tensor_view("token_embd.weight") : nullptr;
+    TensorView* tv_emb = get_view("token_embd", "token_embd.weight", "model.embed_tokens.weight");
     size_t cur_vocab = (tv_emb && !tv_emb->shape.dims.empty()) ? tv_emb->shape.dims[0] : vocab_size_;
     size_t safe_tok = static_cast<size_t>(std::abs(token)) % (cur_vocab > 0 ? cur_vocab : 1);
-    void* emb_raw = tier_mgr_ ? tier_mgr_->activate_parameter("token_embd.weight") : nullptr;
+    void* emb_raw = get_param("token_embd", "token_embd.weight", "model.embed_tokens.weight");
     DataType dt_emb = tv_emb ? tv_emb->dtype : DataType::FP32;
+
+    if (metadata_.is_loaded && !emb_raw) {
+        std::cerr << "[FATAL] Missing embedding weights (token_embd). Check tensor name mapping in model_loader.cpp." << std::endl;
+        return NEXUS_ERR_MISSING_TENSOR;
+    }
 
     if (emb_raw) {
         if (dt_emb == DataType::FP32) {
@@ -358,25 +395,22 @@ int32_t ForwardPassExecutor::forward_token(
             tier_mgr_->prefetch_layer_async(l + 1);
         }
 
-        std::string pfx = "blk." + std::to_string(l) + ".";
-        const float* l_weights = (default_layer_data_.size() > l) ? default_layer_data_[l].data() : nullptr;
+        std::string canon_pfx = "layers." + std::to_string(l) + ".";
+        std::string blk_pfx = "blk." + std::to_string(l) + ".";
+        const float* l_weights = (!metadata_.is_loaded && default_layer_data_.size() > l) ? default_layer_data_[l].data() : nullptr;
         size_t offset = 0;
 
-        void* attn_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_norm.weight") : nullptr;
-        void* wq_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_q.weight") : nullptr;
-        void* wk_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_k.weight") : nullptr;
-        void* wv_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_v.weight") : nullptr;
-        void* wo_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_output.weight") : nullptr;
-        if (!wo_raw && tier_mgr_) wo_raw = tier_mgr_->activate_parameter(pfx + "attn_out.weight");
-        void* ffn_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_norm.weight") : nullptr;
-        void* w_gate_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_gate.weight") : nullptr;
-        if (!w_gate_raw && tier_mgr_) w_gate_raw = tier_mgr_->activate_parameter(pfx + "ffn_gate_exps.weight");
-        void* w_up_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_up.weight") : nullptr;
-        if (!w_up_raw && tier_mgr_) w_up_raw = tier_mgr_->activate_parameter(pfx + "ffn_up_exps.weight");
-        void* w_down_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_down.weight") : nullptr;
-        if (!w_down_raw && tier_mgr_) w_down_raw = tier_mgr_->activate_parameter(pfx + "ffn_down_exps.weight");
+        void* attn_norm_raw = get_param(canon_pfx + "attn_norm", blk_pfx + "attn_norm.weight");
+        void* wq_raw = get_param(canon_pfx + "wq", blk_pfx + "attn_q.weight");
+        void* wk_raw = get_param(canon_pfx + "wk", blk_pfx + "attn_k.weight");
+        void* wv_raw = get_param(canon_pfx + "wv", blk_pfx + "attn_v.weight");
+        void* wo_raw = get_param(canon_pfx + "wo", blk_pfx + "attn_output.weight", blk_pfx + "attn_out.weight");
+        void* ffn_norm_raw = get_param(canon_pfx + "ffn_norm", blk_pfx + "ffn_norm.weight");
+        void* w_gate_raw = get_param(canon_pfx + "ffn_gate", blk_pfx + "ffn_gate.weight", blk_pfx + "ffn_gate_exps.weight");
+        void* w_up_raw = get_param(canon_pfx + "ffn_up", blk_pfx + "ffn_up.weight", blk_pfx + "ffn_up_exps.weight");
+        void* w_down_raw = get_param(canon_pfx + "ffn_down", blk_pfx + "ffn_down.weight", blk_pfx + "ffn_down_exps.weight");
 
-        TensorView* tv_attn_norm = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_norm.weight") : nullptr;
+        TensorView* tv_attn_norm = get_view(canon_pfx + "attn_norm", blk_pfx + "attn_norm.weight");
         DataType dt_attn_norm = tv_attn_norm ? tv_attn_norm->dtype : DataType::FP32;
         const void* attn_norm = attn_norm_raw ? attn_norm_raw : (l_weights ? (l_weights + offset) : nullptr);
         if (l_weights) offset += hidden_size_;
@@ -393,7 +427,7 @@ int32_t ForwardPassExecutor::forward_token(
         const void* wo = wo_raw ? wo_raw : (l_weights ? (l_weights + offset) : nullptr);
         if (l_weights) offset += (hidden_size_ * hidden_size_);
 
-        TensorView* tv_ffn_norm = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_norm.weight") : nullptr;
+        TensorView* tv_ffn_norm = get_view(canon_pfx + "ffn_norm", blk_pfx + "ffn_norm.weight");
         DataType dt_ffn_norm = tv_ffn_norm ? tv_ffn_norm->dtype : DataType::FP32;
         const void* ffn_norm = ffn_norm_raw ? ffn_norm_raw : (l_weights ? (l_weights + offset) : nullptr);
         if (l_weights) offset += hidden_size_;
@@ -406,38 +440,49 @@ int32_t ForwardPassExecutor::forward_token(
 
         const void* w_down = w_down_raw ? w_down_raw : (l_weights ? (l_weights + offset) : nullptr);
 
-        TensorView* tv_wq = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_q.weight") : nullptr;
+        TensorView* tv_wq = get_view(canon_pfx + "wq", blk_pfx + "attn_q.weight");
         DataType dt_wq = tv_wq ? tv_wq->dtype : DataType::FP32;
-        TensorView* tv_wk = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_k.weight") : nullptr;
+        TensorView* tv_wk = get_view(canon_pfx + "wk", blk_pfx + "attn_k.weight");
         DataType dt_wk = tv_wk ? tv_wk->dtype : DataType::FP32;
-        TensorView* tv_wv = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_v.weight") : nullptr;
+        TensorView* tv_wv = get_view(canon_pfx + "wv", blk_pfx + "attn_v.weight");
         DataType dt_wv = tv_wv ? tv_wv->dtype : DataType::FP32;
-        TensorView* tv_wo = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_output.weight") : nullptr;
-        if (!tv_wo && tier_mgr_) tv_wo = tier_mgr_->get_tensor_view(pfx + "attn_out.weight");
+        TensorView* tv_wo = get_view(canon_pfx + "wo", blk_pfx + "attn_output.weight", blk_pfx + "attn_out.weight");
         DataType dt_wo = tv_wo ? tv_wo->dtype : DataType::FP32;
-        TensorView* tv_gate = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_gate.weight") : nullptr;
-        if (!tv_gate && tier_mgr_) tv_gate = tier_mgr_->get_tensor_view(pfx + "ffn_gate_exps.weight");
+        TensorView* tv_gate = get_view(canon_pfx + "ffn_gate", blk_pfx + "ffn_gate.weight", blk_pfx + "ffn_gate_exps.weight");
         DataType dt_gate = tv_gate ? tv_gate->dtype : DataType::FP32;
-        TensorView* tv_up = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_up.weight") : nullptr;
-        if (!tv_up && tier_mgr_) tv_up = tier_mgr_->get_tensor_view(pfx + "ffn_up_exps.weight");
+        TensorView* tv_up = get_view(canon_pfx + "ffn_up", blk_pfx + "ffn_up.weight", blk_pfx + "ffn_up_exps.weight");
         DataType dt_up = tv_up ? tv_up->dtype : DataType::FP32;
-        TensorView* tv_down = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_down.weight") : nullptr;
-        if (!tv_down && tier_mgr_) tv_down = tier_mgr_->get_tensor_view(pfx + "ffn_down_exps.weight");
+        TensorView* tv_down = get_view(canon_pfx + "ffn_down", blk_pfx + "ffn_down.weight", blk_pfx + "ffn_down_exps.weight");
         DataType dt_down = tv_down ? tv_down->dtype : DataType::FP32;
 
         // Strict tensor validation if real model is loaded
-        if (metadata_.is_loaded) {
-            if (!wq_raw || !wk_raw || !wv_raw || !wo_raw || !w_gate_raw || !w_up_raw || !w_down_raw) {
+        if (metadata_.is_loaded || !l_weights) {
+            if (wq == nullptr || wk == nullptr || wv == nullptr || wo == nullptr) {
+                std::cerr << "[FATAL] Layer " << l << ": missing attention weights. Check tensor name mapping in model_loader.cpp." << std::endl;
                 std::cerr << "[Nexus Engine Error] Required tensor missing for layer " << l << ":";
-                if (!wq_raw) std::cerr << " wq";
-                if (!wk_raw) std::cerr << " wk";
-                if (!wv_raw) std::cerr << " wv";
-                if (!wo_raw) std::cerr << " wo";
-                if (!w_gate_raw) std::cerr << " w_gate";
-                if (!w_up_raw) std::cerr << " w_up";
-                if (!w_down_raw) std::cerr << " w_down";
+                if (!wq) std::cerr << " wq";
+                if (!wk) std::cerr << " wk";
+                if (!wv) std::cerr << " wv";
+                if (!wo) std::cerr << " wo";
                 std::cerr << std::endl;
-                return 0;
+                return NEXUS_ERR_MISSING_TENSOR;
+            }
+            if (w_gate == nullptr || w_up == nullptr || w_down == nullptr) {
+                std::cerr << "[FATAL] Layer " << l << ": missing FFN weights. Check tensor name mapping in model_loader.cpp." << std::endl;
+                std::cerr << "[Nexus Engine Error] Required tensor missing for layer " << l << ":";
+                if (!w_gate) std::cerr << " w_gate";
+                if (!w_up) std::cerr << " w_up";
+                if (!w_down) std::cerr << " w_down";
+                std::cerr << std::endl;
+                return NEXUS_ERR_MISSING_TENSOR;
+            }
+            if (attn_norm == nullptr || ffn_norm == nullptr) {
+                std::cerr << "[FATAL] Layer " << l << ": missing norm weights. Check tensor name mapping in model_loader.cpp." << std::endl;
+                std::cerr << "[Nexus Engine Error] Required tensor missing for layer " << l << ":";
+                if (!attn_norm) std::cerr << " attn_norm";
+                if (!ffn_norm) std::cerr << " ffn_norm";
+                std::cerr << std::endl;
+                return NEXUS_ERR_MISSING_TENSOR;
             }
         }
 
@@ -502,15 +547,24 @@ int32_t ForwardPassExecutor::forward_token(
     }
 
     // 3. Final RMSNorm
-    void* out_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output_norm.weight") : nullptr;
-    TensorView* tv_out_norm = tier_mgr_ ? tier_mgr_->get_tensor_view("output_norm.weight") : nullptr;
+    void* out_norm_raw = get_param("output_norm", "output_norm.weight", "model.norm.weight");
+    if (metadata_.is_loaded && !out_norm_raw) {
+        std::cerr << "[FATAL] Missing output norm weights (output_norm). Check tensor name mapping in model_loader.cpp." << std::endl;
+        return NEXUS_ERR_MISSING_TENSOR;
+    }
+    const void* out_norm = out_norm_raw ? out_norm_raw : default_out_norm_.data();
+    TensorView* tv_out_norm = get_view("output_norm", "output_norm.weight", "model.norm.weight");
     DataType dt_out_norm = tv_out_norm ? tv_out_norm->dtype : DataType::FP32;
-    TransformerOps::rmsnorm(act_hidden_.data(), out_norm_raw, dt_out_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
+    TransformerOps::rmsnorm(act_hidden_.data(), out_norm, dt_out_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
 
     // 4. LM Head: logits = gemv(hidden, w_lm_head)
-    void* head_raw = tier_mgr_ ? tier_mgr_->activate_parameter("output.weight") : nullptr;
+    void* head_raw = get_param("lm_head", "output.weight", "lm_head.weight");
+    if (metadata_.is_loaded && !head_raw) {
+        std::cerr << "[FATAL] Missing LM head weights (lm_head/output.weight). Check tensor name mapping in model_loader.cpp." << std::endl;
+        return NEXUS_ERR_MISSING_TENSOR;
+    }
     const void* lm_head = head_raw ? head_raw : default_lm_head_.data();
-    TensorView* tv_head = tier_mgr_ ? tier_mgr_->get_tensor_view("output.weight") : nullptr;
+    TensorView* tv_head = get_view("lm_head", "output.weight", "lm_head.weight");
     DataType dt_head = tv_head ? tv_head->dtype : DataType::FP32;
     size_t out_vocab = (tv_head && !tv_head->shape.dims.empty()) ? tv_head->shape.dims[0] : vocab_size_;
     if (act_logits_.size() < out_vocab) {

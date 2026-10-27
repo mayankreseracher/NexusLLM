@@ -321,6 +321,8 @@ struct TensorView {
 };
 
 // Error codes addressing root causes from arXiv:2506.09713
+constexpr int32_t NEXUS_ERR_MISSING_TENSOR = -4;
+
 enum class NexusStatus : int32_t {
     SUCCESS = 0,
     ERROR_OUT_OF_HOST_MEMORY = -1,

@@ -63,36 +63,60 @@ void UniversalModelLoader::register_aliases(const std::string& name, DataType dt
         }
     };
 
-    // 1. Embeddings
-    if (name == "token_embd.weight" || name == "model.embed_tokens.weight" || 
-        name == "tok_embeddings.weight" || name == "embeddings.weight") {
+    // 1. Embeddings (Canonical: token_embd)
+    if (name == "token_embd" || name == "token_embd.weight" || 
+        name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" || 
+        name == "embeddings.weight" || name == "embed_tokens.weight") {
+        add_alias("token_embd");
         add_alias("token_embd.weight");
         add_alias("model.embed_tokens.weight");
         add_alias("tok_embeddings.weight");
+        add_alias("embeddings.weight");
     }
 
-    // 2. LM Head / Output
-    if (name == "output.weight" || name == "lm_head.weight" || name == "model.lm_head.weight") {
-        add_alias("output.weight");
+    // 2. LM Head / Output (Canonical: lm_head)
+    if (name == "lm_head" || name == "lm_head.weight" || 
+        name == "output.weight" || name == "output" || 
+        name == "model.lm_head.weight") {
+        add_alias("lm_head");
         add_alias("lm_head.weight");
+        add_alias("output.weight");
+        add_alias("output");
+        add_alias("model.lm_head.weight");
     }
 
-    // 3. Final Output Norm
-    if (name == "output_norm.weight" || name == "model.norm.weight" || name == "norm.weight") {
+    // 3. Final Output Norm (Canonical: output_norm)
+    if (name == "output_norm" || name == "output_norm.weight" || 
+        name == "model.norm.weight" || name == "norm.weight") {
+        add_alias("output_norm");
         add_alias("output_norm.weight");
         add_alias("model.norm.weight");
         add_alias("norm.weight");
     }
 
-    // 4. MTP / Medusa heads (e.g. "mtp_head.0.weight", "mtp.0.weight")
-    if (name.rfind("mtp_head.", 0) == 0 || name.rfind("mtp.", 0) == 0) {
-        size_t first_dot = name.find('.');
-        size_t second_dot = name.find('.', first_dot + 1);
-        if (second_dot != std::string::npos) {
-            std::string idx_str = name.substr(first_dot + 1, second_dot - (first_dot + 1));
-            std::string suffix = name.substr(second_dot + 1);
-            add_alias("mtp." + idx_str + "." + suffix);
-            add_alias("mtp_head." + idx_str + "." + suffix);
+    // 4. MTP / Medusa heads (e.g. "mtp_head.0.weight", "mtp.0.weight", "mtp_head.weight", "blk.4.mtp_head.0.weight")
+    if (name.rfind("mtp_head.", 0) == 0 || name.rfind("mtp.", 0) == 0 ||
+        name.find(".mtp") != std::string::npos || name.rfind("mtp", 0) == 0) {
+        std::string idx_str = "0";
+        bool has_idx = false;
+        for (size_t i = 0; i < name.size(); ++i) {
+            if (std::isdigit(static_cast<unsigned char>(name[i]))) {
+                size_t j = i;
+                while (j < name.size() && std::isdigit(static_cast<unsigned char>(name[j]))) {
+                    ++j;
+                }
+                idx_str = name.substr(i, j - i);
+                has_idx = true;
+                break;
+            }
+        }
+        add_alias("mtp." + idx_str + ".weight");
+        add_alias("mtp_head." + idx_str + ".weight");
+        add_alias("mtp." + idx_str);
+        add_alias("mtp_head." + idx_str);
+        if (!has_idx) {
+            add_alias("mtp.weight");
+            add_alias("mtp_head.weight");
         }
     }
 
@@ -132,89 +156,144 @@ void UniversalModelLoader::register_aliases(const std::string& name, DataType dt
     }
 
     if (found_layer) {
+        std::string canon_pfx = "layers." + l_str + ".";
         std::string blk_pfx = "blk." + l_str + ".";
         std::string hf_pfx = "model.layers." + l_str + ".";
 
-        // Attention Norm
-        if (suffix == "attn_norm.weight" || suffix == "input_layernorm.weight" || 
-            suffix == "attention_norm.weight" || suffix == "ln_1.weight") {
+        // Attention Norm (Canonical: layers.{l}.attn_norm)
+        if (suffix == "attn_norm" || suffix == "attn_norm.weight" || 
+            suffix == "input_layernorm.weight" || suffix == "input_layernorm" || 
+            suffix == "attention_norm.weight" || suffix == "attention_norm" || 
+            suffix == "ln_1.weight" || suffix == "ln_1") {
+            add_alias(canon_pfx + "attn_norm");
+            add_alias(canon_pfx + "attn_norm.weight");
             add_alias(blk_pfx + "attn_norm.weight");
+            add_alias(blk_pfx + "attn_norm");
             add_alias(hf_pfx + "input_layernorm.weight");
         }
-        // FFN Norm
-        else if (suffix == "ffn_norm.weight" || suffix == "post_attention_layernorm.weight" || 
-                 suffix == "ln_2.weight") {
+        // FFN Norm (Canonical: layers.{l}.ffn_norm)
+        else if (suffix == "ffn_norm" || suffix == "ffn_norm.weight" || 
+                 suffix == "post_attention_layernorm.weight" || suffix == "post_attention_layernorm" || 
+                 suffix == "ln_2.weight" || suffix == "ln_2") {
+            add_alias(canon_pfx + "ffn_norm");
+            add_alias(canon_pfx + "ffn_norm.weight");
             add_alias(blk_pfx + "ffn_norm.weight");
+            add_alias(blk_pfx + "ffn_norm");
             add_alias(hf_pfx + "post_attention_layernorm.weight");
         }
-        // Q projection
-        else if (suffix == "attn_q.weight" || suffix == "self_attn.q_proj.weight" || 
+        // Q projection (Canonical: layers.{l}.wq)
+        else if (suffix == "wq" || suffix == "wq.weight" || 
+                 suffix == "attn_q.weight" || suffix == "attn_q" || 
+                 suffix == "self_attn.q_proj.weight" || suffix == "self_attn.q_proj" || 
+                 suffix == "q_proj.weight" || suffix == "q_proj" || 
                  suffix == "attention.wq.weight") {
+            add_alias(canon_pfx + "wq");
+            add_alias(canon_pfx + "wq.weight");
             add_alias(blk_pfx + "attn_q.weight");
+            add_alias(blk_pfx + "attn_q");
             add_alias(hf_pfx + "self_attn.q_proj.weight");
         }
-        // K projection
-        else if (suffix == "attn_k.weight" || suffix == "self_attn.k_proj.weight" || 
+        // K projection (Canonical: layers.{l}.wk)
+        else if (suffix == "wk" || suffix == "wk.weight" || 
+                 suffix == "attn_k.weight" || suffix == "attn_k" || 
+                 suffix == "self_attn.k_proj.weight" || suffix == "self_attn.k_proj" || 
+                 suffix == "k_proj.weight" || suffix == "k_proj" || 
                  suffix == "attention.wk.weight") {
+            add_alias(canon_pfx + "wk");
+            add_alias(canon_pfx + "wk.weight");
             add_alias(blk_pfx + "attn_k.weight");
+            add_alias(blk_pfx + "attn_k");
             add_alias(hf_pfx + "self_attn.k_proj.weight");
         }
-        // V projection
-        else if (suffix == "attn_v.weight" || suffix == "self_attn.v_proj.weight" || 
+        // V projection (Canonical: layers.{l}.wv)
+        else if (suffix == "wv" || suffix == "wv.weight" || 
+                 suffix == "attn_v.weight" || suffix == "attn_v" || 
+                 suffix == "self_attn.v_proj.weight" || suffix == "self_attn.v_proj" || 
+                 suffix == "v_proj.weight" || suffix == "v_proj" || 
                  suffix == "attention.wv.weight") {
+            add_alias(canon_pfx + "wv");
+            add_alias(canon_pfx + "wv.weight");
             add_alias(blk_pfx + "attn_v.weight");
+            add_alias(blk_pfx + "attn_v");
             add_alias(hf_pfx + "self_attn.v_proj.weight");
         }
-        // Output projection (supports both attn_output and attn_out)
-        else if (suffix == "attn_output.weight" || suffix == "attn_out.weight" || 
-                 suffix == "self_attn.o_proj.weight" || suffix == "attention.wo.weight") {
+        // Output projection (Canonical: layers.{l}.wo)
+        else if (suffix == "wo" || suffix == "wo.weight" || 
+                 suffix == "attn_output.weight" || suffix == "attn_output" || 
+                 suffix == "attn_out.weight" || suffix == "attn_out" || 
+                 suffix == "self_attn.o_proj.weight" || suffix == "self_attn.o_proj" || 
+                 suffix == "o_proj.weight" || suffix == "o_proj" || 
+                 suffix == "attention.wo.weight") {
+            add_alias(canon_pfx + "wo");
+            add_alias(canon_pfx + "wo.weight");
             add_alias(blk_pfx + "attn_output.weight");
             add_alias(blk_pfx + "attn_out.weight");
+            add_alias(blk_pfx + "attn_output");
             add_alias(hf_pfx + "self_attn.o_proj.weight");
         }
-        // FFN Gate
-        else if (suffix == "ffn_gate.weight" || suffix == "mlp.gate_proj.weight" || 
-                 suffix == "feed_forward.w1.weight") {
-            add_alias(blk_pfx + "ffn_gate.weight");
-            add_alias(hf_pfx + "mlp.gate_proj.weight");
-        }
-        // FFN Up
-        else if (suffix == "ffn_up.weight" || suffix == "mlp.up_proj.weight" || 
-                 suffix == "feed_forward.w3.weight") {
-            add_alias(blk_pfx + "ffn_up.weight");
-            add_alias(hf_pfx + "mlp.up_proj.weight");
-        }
-        // FFN Down
-        else if (suffix == "ffn_down.weight" || suffix == "mlp.down_proj.weight" || 
-                 suffix == "feed_forward.w2.weight") {
-            add_alias(blk_pfx + "ffn_down.weight");
-            add_alias(hf_pfx + "mlp.down_proj.weight");
-        }
-        // MoE Expert weights
-        else if (suffix == "ffn_gate_exps.weight") {
+        // FFN Gate (Canonical: layers.{l}.ffn_gate)
+        else if (suffix == "ffn_gate" || suffix == "ffn_gate.weight" || 
+                 suffix == "mlp.gate_proj.weight" || suffix == "mlp.gate_proj" || 
+                 suffix == "gate_proj.weight" || suffix == "gate_proj" || 
+                 suffix == "feed_forward.w1.weight" || 
+                 suffix == "ffn_gate_exps.weight" || suffix == "ffn_gate_exps") {
+            add_alias(canon_pfx + "ffn_gate");
+            add_alias(canon_pfx + "ffn_gate.weight");
             add_alias(blk_pfx + "ffn_gate.weight");
             add_alias(blk_pfx + "ffn_gate_exps.weight");
+            add_alias(blk_pfx + "ffn_gate");
+            add_alias(hf_pfx + "mlp.gate_proj.weight");
         }
-        else if (suffix == "ffn_up_exps.weight") {
+        // FFN Up (Canonical: layers.{l}.ffn_up)
+        else if (suffix == "ffn_up" || suffix == "ffn_up.weight" || 
+                 suffix == "mlp.up_proj.weight" || suffix == "mlp.up_proj" || 
+                 suffix == "up_proj.weight" || suffix == "up_proj" || 
+                 suffix == "feed_forward.w3.weight" || 
+                 suffix == "ffn_up_exps.weight" || suffix == "ffn_up_exps") {
+            add_alias(canon_pfx + "ffn_up");
+            add_alias(canon_pfx + "ffn_up.weight");
             add_alias(blk_pfx + "ffn_up.weight");
             add_alias(blk_pfx + "ffn_up_exps.weight");
+            add_alias(blk_pfx + "ffn_up");
+            add_alias(hf_pfx + "mlp.up_proj.weight");
         }
-        else if (suffix == "ffn_down_exps.weight") {
+        // FFN Down (Canonical: layers.{l}.ffn_down)
+        else if (suffix == "ffn_down" || suffix == "ffn_down.weight" || 
+                 suffix == "mlp.down_proj.weight" || suffix == "mlp.down_proj" || 
+                 suffix == "down_proj.weight" || suffix == "down_proj" || 
+                 suffix == "feed_forward.w2.weight" || 
+                 suffix == "ffn_down_exps.weight" || suffix == "ffn_down_exps") {
+            add_alias(canon_pfx + "ffn_down");
+            add_alias(canon_pfx + "ffn_down.weight");
             add_alias(blk_pfx + "ffn_down.weight");
             add_alias(blk_pfx + "ffn_down_exps.weight");
+            add_alias(blk_pfx + "ffn_down");
+            add_alias(hf_pfx + "mlp.down_proj.weight");
         }
         // Biases (Qwen uses QKV biases)
-        else if (suffix == "attn_q.bias" || suffix == "self_attn.q_proj.bias") {
+        else if (suffix == "attn_q.bias" || suffix == "wq.bias" || suffix == "self_attn.q_proj.bias") {
+            add_alias(canon_pfx + "wq.bias");
             add_alias(blk_pfx + "attn_q.bias");
             add_alias(hf_pfx + "self_attn.q_proj.bias");
         }
-        else if (suffix == "attn_k.bias" || suffix == "self_attn.k_proj.bias") {
+        else if (suffix == "attn_k.bias" || suffix == "wk.bias" || suffix == "self_attn.k_proj.bias") {
+            add_alias(canon_pfx + "wk.bias");
             add_alias(blk_pfx + "attn_k.bias");
             add_alias(hf_pfx + "self_attn.k_proj.bias");
         }
-        else if (suffix == "attn_v.bias" || suffix == "self_attn.v_proj.bias") {
+        else if (suffix == "attn_v.bias" || suffix == "wv.bias" || suffix == "self_attn.v_proj.bias") {
+            add_alias(canon_pfx + "wv.bias");
             add_alias(blk_pfx + "attn_v.bias");
             add_alias(hf_pfx + "self_attn.v_proj.bias");
+        }
+        // Layer MTP tensors (e.g. blk.{l}.mtp_head.weight, blk.{l}.mtp_head.0.weight)
+        else if (suffix.find("mtp") != std::string::npos) {
+            add_alias(canon_pfx + suffix);
+            add_alias(blk_pfx + suffix);
+            add_alias("mtp." + l_str + ".weight");
+            add_alias("mtp_head." + l_str + ".weight");
+            add_alias("mtp." + l_str);
+            add_alias("mtp_head." + l_str);
         }
     }
 }
@@ -239,6 +318,11 @@ NexusStatus UniversalModelLoader::load_model(const std::string& model_path) {
 }
 
 NexusStatus UniversalModelLoader::load_safetensors(const std::string& filepath) {
+    if (tier_mgr_) {
+        tier_mgr_->clear_registry();
+    }
+    loaded_tensors_.clear();
+
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "[UniversalModelLoader] Cannot open SafeTensors file: " << filepath << std::endl;
@@ -301,9 +385,24 @@ NexusStatus UniversalModelLoader::load_safetensors(const std::string& filepath) 
 
             tier_mgr_->register_parameter(t_name, dt, shape, buf.data());
             loaded_tensors_.push_back(t_name);
+
+            auto tv = tier_mgr_->get_tensor_view(t_name);
+            if (tv && tv->host_ptr) {
+                register_aliases(t_name, dt, shape, tv->host_ptr);
+            }
         }
 
         pos = dt_end + 1;
+    }
+
+    // Weight tying fallback: if lm_head / output.weight is not present, alias to token_embd
+    auto tv_st_out = tier_mgr_->get_tensor_view("lm_head");
+    if (!tv_st_out) tv_st_out = tier_mgr_->get_tensor_view("output.weight");
+    auto tv_st_emb = tier_mgr_->get_tensor_view("token_embd");
+    if (!tv_st_emb) tv_st_emb = tier_mgr_->get_tensor_view("token_embd.weight");
+    if (!tv_st_out && tv_st_emb) {
+        tier_mgr_->register_parameter_mapped("output.weight", tv_st_emb->dtype, tv_st_emb->shape, tv_st_emb->host_ptr);
+        tier_mgr_->register_parameter_mapped("lm_head", tv_st_emb->dtype, tv_st_emb->shape, tv_st_emb->host_ptr);
     }
 
     std::cout << "[UniversalModelLoader] Loaded " << loaded_tensors_.size() 
@@ -314,6 +413,11 @@ NexusStatus UniversalModelLoader::load_safetensors(const std::string& filepath) 
 
 NexusStatus UniversalModelLoader::load_gguf(const std::string& filepath) {
     unmap_file();
+
+    if (tier_mgr_) {
+        tier_mgr_->clear_registry();
+    }
+    loaded_tensors_.clear();
 
 #if defined(NEXUS_PLATFORM_WINDOWS)
     HANDLE hFile = CreateFileA(
@@ -667,16 +771,30 @@ NexusStatus UniversalModelLoader::load_gguf(const std::string& filepath) {
                 } catch (...) {}
             }
         }
+        size_t canon_layer_pos = info.name.find("layers.");
+        if (canon_layer_pos != std::string::npos && info.name.find("model.layers.") == std::string::npos) {
+            size_t next_dot = info.name.find('.', canon_layer_pos + 7);
+            if (next_dot != std::string::npos) {
+                try {
+                    size_t l_idx = std::stoul(info.name.substr(canon_layer_pos + 7, next_dot - (canon_layer_pos + 7)));
+                    if (l_idx > max_layer_idx) max_layer_idx = l_idx;
+                    found_any_layer = true;
+                } catch (...) {}
+            }
+        }
 
         // Register canonical aliases
         register_aliases(info.name, dt, shape, mapped_tensor_ptr);
     }
 
-    // Weight tying fallback: if output.weight is not present, alias to token_embd.weight
+    // Weight tying fallback: if output.weight / lm_head is not present, alias to token_embd
     auto tv_out = tier_mgr_->get_tensor_view("output.weight");
+    if (!tv_out) tv_out = tier_mgr_->get_tensor_view("lm_head");
     auto tv_emb = tier_mgr_->get_tensor_view("token_embd.weight");
+    if (!tv_emb) tv_emb = tier_mgr_->get_tensor_view("token_embd");
     if (!tv_out && tv_emb) {
         tier_mgr_->register_parameter_mapped("output.weight", tv_emb->dtype, tv_emb->shape, tv_emb->host_ptr);
+        tier_mgr_->register_parameter_mapped("lm_head", tv_emb->dtype, tv_emb->shape, tv_emb->host_ptr);
     }
 
     // Infer any missing architecture dimensions from tensor metadata

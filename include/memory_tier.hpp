@@ -82,6 +82,9 @@ public:
         return registry_;
     }
 
+    // Clear registry and reset allocations (called when loading a new model to eliminate stale synthetic weights)
+    void clear_registry();
+
 private:
     void prefetch_worker_loop();
 
