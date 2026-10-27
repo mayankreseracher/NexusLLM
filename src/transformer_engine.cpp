@@ -205,10 +205,14 @@ int32_t TransformerEngine::forward_token(
         void* wk_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_k.weight") : nullptr;
         void* wv_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_v.weight") : nullptr;
         void* wo_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "attn_output.weight") : nullptr;
+        if (!wo_raw && tier_mgr_) wo_raw = tier_mgr_->activate_parameter(pfx + "attn_out.weight");
         void* ffn_norm_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_norm.weight") : nullptr;
         void* w_gate_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_gate.weight") : nullptr;
+        if (!w_gate_raw && tier_mgr_) w_gate_raw = tier_mgr_->activate_parameter(pfx + "ffn_gate_exps.weight");
         void* w_up_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_up.weight") : nullptr;
+        if (!w_up_raw && tier_mgr_) w_up_raw = tier_mgr_->activate_parameter(pfx + "ffn_up_exps.weight");
         void* w_down_raw = tier_mgr_ ? tier_mgr_->activate_parameter(pfx + "ffn_down.weight") : nullptr;
+        if (!w_down_raw && tier_mgr_) w_down_raw = tier_mgr_->activate_parameter(pfx + "ffn_down_exps.weight");
 
         TensorView* tv_attn_norm = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_norm.weight") : nullptr;
         DataType dt_attn_norm = tv_attn_norm ? tv_attn_norm->dtype : DataType::FP32;
@@ -245,7 +249,15 @@ int32_t TransformerEngine::forward_token(
         // Strict tensor validation if real model is loaded from disk
         if (metadata_.is_loaded) {
             if (!wq_raw || !wk_raw || !wv_raw || !wo_raw || !w_gate_raw || !w_up_raw || !w_down_raw) {
-                std::cerr << "[TransformerEngine Error] Required tensor missing for layer " << l << std::endl;
+                std::cerr << "[TransformerEngine Error] Required tensor missing for layer " << l << ":";
+                if (!wq_raw) std::cerr << " wq";
+                if (!wk_raw) std::cerr << " wk";
+                if (!wv_raw) std::cerr << " wv";
+                if (!wo_raw) std::cerr << " wo";
+                if (!w_gate_raw) std::cerr << " w_gate";
+                if (!w_up_raw) std::cerr << " w_up";
+                if (!w_down_raw) std::cerr << " w_down";
+                std::cerr << std::endl;
                 return 0;
             }
         }
@@ -267,15 +279,19 @@ int32_t TransformerEngine::forward_token(
         DataType dt_wv = tv_wv ? tv_wv->dtype : DataType::FP32;
 
         TensorView* tv_wo = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "attn_output.weight") : nullptr;
+        if (!tv_wo && tier_mgr_) tv_wo = tier_mgr_->get_tensor_view(pfx + "attn_out.weight");
         DataType dt_wo = tv_wo ? tv_wo->dtype : DataType::FP32;
 
         TensorView* tv_gate = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_gate.weight") : nullptr;
+        if (!tv_gate && tier_mgr_) tv_gate = tier_mgr_->get_tensor_view(pfx + "ffn_gate_exps.weight");
         DataType dt_gate = tv_gate ? tv_gate->dtype : DataType::FP32;
 
         TensorView* tv_up = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_up.weight") : nullptr;
+        if (!tv_up && tier_mgr_) tv_up = tier_mgr_->get_tensor_view(pfx + "ffn_up_exps.weight");
         DataType dt_up = tv_up ? tv_up->dtype : DataType::FP32;
 
         TensorView* tv_down = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_down.weight") : nullptr;
+        if (!tv_down && tier_mgr_) tv_down = tier_mgr_->get_tensor_view(pfx + "ffn_down_exps.weight");
         DataType dt_down = tv_down ? tv_down->dtype : DataType::FP32;
 
         // Compute Q, K, V projections via matrix-vector multiplication (supporting FP32, FP16, Q4_0, Q8_0)

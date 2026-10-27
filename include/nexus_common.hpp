@@ -248,7 +248,12 @@ enum class DataType : uint32_t {
     INT4_GPTQ = 6,
     GGUF_Q4_0 = 7,
     GGUF_Q4_K = 8,
-    GGUF_Q8_0 = 9
+    GGUF_Q8_0 = 9,
+    GGUF_Q5_0 = 10,
+    GGUF_Q5_K = 11,
+    GGUF_Q6_K = 12,
+    GGUF_Q2_K = 13,
+    GGUF_Q3_K = 14
 };
 
 inline size_t get_element_size_bits(DataType dt) {
@@ -260,9 +265,14 @@ inline size_t get_element_size_bits(DataType dt) {
         case DataType::INT8: return 8;
         case DataType::INT4_AWQ: return 4;
         case DataType::INT4_GPTQ: return 4;
-        case DataType::GGUF_Q4_0: return 4; // average bits
-        case DataType::GGUF_Q4_K: return 4;
-        case DataType::GGUF_Q8_0: return 8;
+        case DataType::GGUF_Q2_K: return 3;
+        case DataType::GGUF_Q3_K: return 4;
+        case DataType::GGUF_Q4_0: return 5;
+        case DataType::GGUF_Q4_K: return 5;
+        case DataType::GGUF_Q5_0: return 6;
+        case DataType::GGUF_Q5_K: return 6;
+        case DataType::GGUF_Q6_K: return 7;
+        case DataType::GGUF_Q8_0: return 9;
         default: return 32;
     }
 }

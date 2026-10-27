@@ -57,56 +57,164 @@ void UniversalModelLoader::unmap_file() {
 void UniversalModelLoader::register_aliases(const std::string& name, DataType dt, const TensorShape& shape, const void* ptr) {
     if (!ptr || !tier_mgr_) return;
 
-    // 1. Embedding
-    if (name == "model.embed_tokens.weight" || name == "tok_embeddings.weight") {
-        tier_mgr_->register_parameter_mapped("token_embd.weight", dt, shape, ptr);
-    }
-    // 2. Output / LM Head
-    if (name == "lm_head.weight" || name == "output.weight") {
-        tier_mgr_->register_parameter_mapped("output.weight", dt, shape, ptr);
-    }
-    // 3. Final Norm
-    if (name == "model.norm.weight" || name == "norm.weight") {
-        tier_mgr_->register_parameter_mapped("output_norm.weight", dt, shape, ptr);
-    }
-    // 4. HuggingFace style: model.layers.<l>.*
-    size_t ml_pos = name.find("model.layers.");
-    if (ml_pos != std::string::npos) {
-        size_t next_dot = name.find('.', ml_pos + 13);
-        if (next_dot != std::string::npos) {
-            std::string l_str = name.substr(ml_pos + 13, next_dot - (ml_pos + 13));
-            std::string suffix = name.substr(next_dot + 1);
-            std::string canonical_pfx = "blk." + l_str + ".";
+    auto add_alias = [&](const std::string& alias) {
+        if (alias != name && tier_mgr_->get_tensor_view(alias) == nullptr) {
+            tier_mgr_->register_parameter_mapped(alias, dt, shape, ptr);
+        }
+    };
 
-            if (suffix == "self_attn.q_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_q.weight", dt, shape, ptr);
-            else if (suffix == "self_attn.k_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_k.weight", dt, shape, ptr);
-            else if (suffix == "self_attn.v_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_v.weight", dt, shape, ptr);
-            else if (suffix == "self_attn.o_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_output.weight", dt, shape, ptr);
-            else if (suffix == "input_layernorm.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "attn_norm.weight", dt, shape, ptr);
-            else if (suffix == "post_attention_layernorm.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_norm.weight", dt, shape, ptr);
-            else if (suffix == "mlp.gate_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_gate.weight", dt, shape, ptr);
-            else if (suffix == "mlp.up_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_up.weight", dt, shape, ptr);
-            else if (suffix == "mlp.down_proj.weight") tier_mgr_->register_parameter_mapped(canonical_pfx + "ffn_down.weight", dt, shape, ptr);
+    // 1. Embeddings
+    if (name == "token_embd.weight" || name == "model.embed_tokens.weight" || 
+        name == "tok_embeddings.weight" || name == "embeddings.weight") {
+        add_alias("token_embd.weight");
+        add_alias("model.embed_tokens.weight");
+        add_alias("tok_embeddings.weight");
+    }
+
+    // 2. LM Head / Output
+    if (name == "output.weight" || name == "lm_head.weight" || name == "model.lm_head.weight") {
+        add_alias("output.weight");
+        add_alias("lm_head.weight");
+    }
+
+    // 3. Final Output Norm
+    if (name == "output_norm.weight" || name == "model.norm.weight" || name == "norm.weight") {
+        add_alias("output_norm.weight");
+        add_alias("model.norm.weight");
+        add_alias("norm.weight");
+    }
+
+    // 4. MTP / Medusa heads (e.g. "mtp_head.0.weight", "mtp.0.weight")
+    if (name.rfind("mtp_head.", 0) == 0 || name.rfind("mtp.", 0) == 0) {
+        size_t first_dot = name.find('.');
+        size_t second_dot = name.find('.', first_dot + 1);
+        if (second_dot != std::string::npos) {
+            std::string idx_str = name.substr(first_dot + 1, second_dot - (first_dot + 1));
+            std::string suffix = name.substr(second_dot + 1);
+            add_alias("mtp." + idx_str + "." + suffix);
+            add_alias("mtp_head." + idx_str + "." + suffix);
         }
     }
-    // 5. GGUF blk.<l>.*
-    size_t blk_pos = name.find("blk.");
-    if (blk_pos != std::string::npos) {
-        size_t next_dot = name.find('.', blk_pos + 4);
-        if (next_dot != std::string::npos) {
-            std::string l_str = name.substr(blk_pos + 4, next_dot - (blk_pos + 4));
-            std::string suffix = name.substr(next_dot + 1);
-            std::string hf_pfx = "model.layers." + l_str + ".";
 
-            if (suffix == "attn_q.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.q_proj.weight", dt, shape, ptr);
-            else if (suffix == "attn_k.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.k_proj.weight", dt, shape, ptr);
-            else if (suffix == "attn_v.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.v_proj.weight", dt, shape, ptr);
-            else if (suffix == "attn_output.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "self_attn.o_proj.weight", dt, shape, ptr);
-            else if (suffix == "attn_norm.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "input_layernorm.weight", dt, shape, ptr);
-            else if (suffix == "ffn_norm.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "post_attention_layernorm.weight", dt, shape, ptr);
-            else if (suffix == "ffn_gate.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "mlp.gate_proj.weight", dt, shape, ptr);
-            else if (suffix == "ffn_up.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "mlp.up_proj.weight", dt, shape, ptr);
-            else if (suffix == "ffn_down.weight") tier_mgr_->register_parameter_mapped(hf_pfx + "mlp.down_proj.weight", dt, shape, ptr);
+    // 5. Layer tensors
+    std::string l_str;
+    std::string suffix;
+    bool found_layer = false;
+
+    if (name.rfind("blk.", 0) == 0) {
+        size_t next_dot = name.find('.', 4);
+        if (next_dot != std::string::npos) {
+            l_str = name.substr(4, next_dot - 4);
+            suffix = name.substr(next_dot + 1);
+            found_layer = true;
+        }
+    } else if (name.rfind("model.layers.", 0) == 0) {
+        size_t next_dot = name.find('.', 13);
+        if (next_dot != std::string::npos) {
+            l_str = name.substr(13, next_dot - 13);
+            suffix = name.substr(next_dot + 1);
+            found_layer = true;
+        }
+    } else if (name.rfind("layers.", 0) == 0) {
+        size_t next_dot = name.find('.', 7);
+        if (next_dot != std::string::npos) {
+            l_str = name.substr(7, next_dot - 7);
+            suffix = name.substr(next_dot + 1);
+            found_layer = true;
+        }
+    } else if (name.rfind("transformer.h.", 0) == 0) {
+        size_t next_dot = name.find('.', 14);
+        if (next_dot != std::string::npos) {
+            l_str = name.substr(14, next_dot - 14);
+            suffix = name.substr(next_dot + 1);
+            found_layer = true;
+        }
+    }
+
+    if (found_layer) {
+        std::string blk_pfx = "blk." + l_str + ".";
+        std::string hf_pfx = "model.layers." + l_str + ".";
+
+        // Attention Norm
+        if (suffix == "attn_norm.weight" || suffix == "input_layernorm.weight" || 
+            suffix == "attention_norm.weight" || suffix == "ln_1.weight") {
+            add_alias(blk_pfx + "attn_norm.weight");
+            add_alias(hf_pfx + "input_layernorm.weight");
+        }
+        // FFN Norm
+        else if (suffix == "ffn_norm.weight" || suffix == "post_attention_layernorm.weight" || 
+                 suffix == "ln_2.weight") {
+            add_alias(blk_pfx + "ffn_norm.weight");
+            add_alias(hf_pfx + "post_attention_layernorm.weight");
+        }
+        // Q projection
+        else if (suffix == "attn_q.weight" || suffix == "self_attn.q_proj.weight" || 
+                 suffix == "attention.wq.weight") {
+            add_alias(blk_pfx + "attn_q.weight");
+            add_alias(hf_pfx + "self_attn.q_proj.weight");
+        }
+        // K projection
+        else if (suffix == "attn_k.weight" || suffix == "self_attn.k_proj.weight" || 
+                 suffix == "attention.wk.weight") {
+            add_alias(blk_pfx + "attn_k.weight");
+            add_alias(hf_pfx + "self_attn.k_proj.weight");
+        }
+        // V projection
+        else if (suffix == "attn_v.weight" || suffix == "self_attn.v_proj.weight" || 
+                 suffix == "attention.wv.weight") {
+            add_alias(blk_pfx + "attn_v.weight");
+            add_alias(hf_pfx + "self_attn.v_proj.weight");
+        }
+        // Output projection (supports both attn_output and attn_out)
+        else if (suffix == "attn_output.weight" || suffix == "attn_out.weight" || 
+                 suffix == "self_attn.o_proj.weight" || suffix == "attention.wo.weight") {
+            add_alias(blk_pfx + "attn_output.weight");
+            add_alias(blk_pfx + "attn_out.weight");
+            add_alias(hf_pfx + "self_attn.o_proj.weight");
+        }
+        // FFN Gate
+        else if (suffix == "ffn_gate.weight" || suffix == "mlp.gate_proj.weight" || 
+                 suffix == "feed_forward.w1.weight") {
+            add_alias(blk_pfx + "ffn_gate.weight");
+            add_alias(hf_pfx + "mlp.gate_proj.weight");
+        }
+        // FFN Up
+        else if (suffix == "ffn_up.weight" || suffix == "mlp.up_proj.weight" || 
+                 suffix == "feed_forward.w3.weight") {
+            add_alias(blk_pfx + "ffn_up.weight");
+            add_alias(hf_pfx + "mlp.up_proj.weight");
+        }
+        // FFN Down
+        else if (suffix == "ffn_down.weight" || suffix == "mlp.down_proj.weight" || 
+                 suffix == "feed_forward.w2.weight") {
+            add_alias(blk_pfx + "ffn_down.weight");
+            add_alias(hf_pfx + "mlp.down_proj.weight");
+        }
+        // MoE Expert weights
+        else if (suffix == "ffn_gate_exps.weight") {
+            add_alias(blk_pfx + "ffn_gate.weight");
+            add_alias(blk_pfx + "ffn_gate_exps.weight");
+        }
+        else if (suffix == "ffn_up_exps.weight") {
+            add_alias(blk_pfx + "ffn_up.weight");
+            add_alias(blk_pfx + "ffn_up_exps.weight");
+        }
+        else if (suffix == "ffn_down_exps.weight") {
+            add_alias(blk_pfx + "ffn_down.weight");
+            add_alias(blk_pfx + "ffn_down_exps.weight");
+        }
+        // Biases (Qwen uses QKV biases)
+        else if (suffix == "attn_q.bias" || suffix == "self_attn.q_proj.bias") {
+            add_alias(blk_pfx + "attn_q.bias");
+            add_alias(hf_pfx + "self_attn.q_proj.bias");
+        }
+        else if (suffix == "attn_k.bias" || suffix == "self_attn.k_proj.bias") {
+            add_alias(blk_pfx + "attn_k.bias");
+            add_alias(hf_pfx + "self_attn.k_proj.bias");
+        }
+        else if (suffix == "attn_v.bias" || suffix == "self_attn.v_proj.bias") {
+            add_alias(blk_pfx + "attn_v.bias");
+            add_alias(hf_pfx + "self_attn.v_proj.bias");
         }
     }
 }
@@ -521,9 +629,14 @@ NexusStatus UniversalModelLoader::load_gguf(const std::string& filepath) {
         if (info.ggml_type == 0) dt = DataType::FP32;
         else if (info.ggml_type == 1) dt = DataType::FP16;
         else if (info.ggml_type == 2 || info.ggml_type == 3) dt = DataType::GGUF_Q4_0;
-        else if (info.ggml_type == 8) dt = DataType::GGUF_Q8_0;
+        else if (info.ggml_type == 6 || info.ggml_type == 7) dt = DataType::GGUF_Q5_0;
+        else if (info.ggml_type == 8 || info.ggml_type == 9) dt = DataType::GGUF_Q8_0;
+        else if (info.ggml_type == 10) dt = DataType::GGUF_Q2_K;
+        else if (info.ggml_type == 11) dt = DataType::GGUF_Q3_K;
         else if (info.ggml_type == 12) dt = DataType::GGUF_Q4_K;
-        else if (info.ggml_type == 24) dt = DataType::BF16;
+        else if (info.ggml_type == 13) dt = DataType::GGUF_Q5_K;
+        else if (info.ggml_type == 14) dt = DataType::GGUF_Q6_K;
+        else if (info.ggml_type >= 24) dt = DataType::BF16;
 
         TensorShape shape;
         shape.dims = info.dims;
