@@ -335,6 +335,10 @@ NEXUS_API int32_t nexus_step_speculative_verify(
     return 0;
 }
 
+// Numerical Verification Unit-Test ABI only:
+// Tests FlashAttention tiled online softmax against naive attention using deterministically varied
+// synthetic vectors (sin/cos) across multi-block sequences to guarantee exact mathematical equivalence.
+// Never invoked during model inference or forward decoding.
 NEXUS_API float nexus_verify_flash_attention(void) {
     const size_t num_heads = 4;
     const size_t num_kv_heads = 4;

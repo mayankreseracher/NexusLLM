@@ -51,7 +51,10 @@ TransformerEngine::TransformerEngine(
 }
 
 void TransformerEngine::initialize_default_weights() {
-    if (weights_ready_) return;
+    if (weights_ready_ || metadata_.is_loaded) {
+        weights_ready_ = true;
+        return;
+    }
 
     // If real weights are already registered in tier_mgr_, do NOT overwrite with defaults
     if (tier_mgr_ && (tier_mgr_->get_tensor_view("output.weight") != nullptr ||
@@ -61,7 +64,8 @@ void TransformerEngine::initialize_default_weights() {
         return;
     }
 
-    // Generate deterministic normalized weight matrices so forward execution produces genuine distributions
+    // Synthetic parameter initialization for standalone offline unit tests and
+    // scheduler micro-benchmarks when no external GGUF/SafeTensors model is loaded.
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 0.02f);
 
@@ -237,6 +241,14 @@ int32_t TransformerEngine::forward_token(
         if (l_weights) offset += (intermediate_size_ * hidden_size_);
 
         const void* w_down = w_down_raw ? w_down_raw : (l_weights ? (l_weights + offset) : nullptr);
+
+        // Strict tensor validation if real model is loaded from disk
+        if (metadata_.is_loaded) {
+            if (!wq_raw || !wk_raw || !wv_raw || !wo_raw || !w_gate_raw || !w_up_raw || !w_down_raw) {
+                std::cerr << "[TransformerEngine Error] Required tensor missing for layer " << l << std::endl;
+                return 0;
+            }
+        }
 
         // Pre-Attention RMSNorm
         if (backend_) {
@@ -446,10 +458,8 @@ std::vector<int32_t> TransformerEngine::predict_mtp_draft(
             drafts.push_back(pred);
             prev_tok = pred;
         } else {
-            // Fast autoregressive draft heuristic projection
-            int32_t draft_tok = static_cast<int32_t>((std::abs(prev_tok) * 1103515245ULL + (k + 1) * 12345ULL) % vocab_size_);
-            drafts.push_back(draft_tok);
-            prev_tok = draft_tok;
+            // No MTP/Medusa auxiliary head registered for position k; stop drafting without hallucinating fake tokens
+            break;
         }
     }
     return drafts;

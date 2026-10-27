@@ -13,58 +13,23 @@ ForwardPassExecutor::ForwardPassExecutor(
     const ModelMetadata& metadata
 ) : tier_mgr_(tier_mgr), kv_mgr_(kv_mgr), metadata_(metadata) {
 
-    // First check if parameters are already registered in tier_mgr_
-    TensorView* tv_head_chk = tier_mgr_ ? tier_mgr_->get_tensor_view("output.weight") : nullptr;
-    TensorView* tv_emb_chk = tier_mgr_ ? tier_mgr_->get_tensor_view("token_embd.weight") : nullptr;
-    TensorView* tv_q_chk = tier_mgr_ ? tier_mgr_->get_tensor_view("blk.0.attn_q.weight") : nullptr;
-    TensorView* tv_gate_chk = tier_mgr_ ? tier_mgr_->get_tensor_view("blk.0.ffn_gate.weight") : nullptr;
-
-    if (tv_head_chk && tv_head_chk->shape.dims.size() >= 2) {
-        vocab_size_ = tv_head_chk->shape.dims[0];
-        hidden_size_ = tv_head_chk->shape.dims[1];
-    } else if (tv_emb_chk && tv_emb_chk->shape.dims.size() >= 2) {
-        vocab_size_ = tv_emb_chk->shape.dims[0];
-        hidden_size_ = tv_emb_chk->shape.dims[1];
-    } else if (metadata_.vocab_size > 0) {
-        vocab_size_ = metadata_.vocab_size;
-        hidden_size_ = metadata_.hidden_size > 0 ? metadata_.hidden_size : 256;
-    } else {
-        vocab_size_ = 1000;
-        hidden_size_ = 256;
-    }
-
-    if (tv_gate_chk && tv_gate_chk->shape.dims.size() >= 2) {
-        intermediate_size_ = tv_gate_chk->shape.dims[0];
-    } else {
+    if (metadata_.is_loaded) {
+        hidden_size_ = metadata_.hidden_size;
         intermediate_size_ = metadata_.intermediate_size > 0 ? metadata_.intermediate_size : (hidden_size_ * 2);
-    }
-
-    if (metadata_.num_attention_heads > 0) {
-        num_heads_ = metadata_.num_attention_heads;
-    } else {
-        num_heads_ = 4;
-    }
-
-    if (metadata_.num_key_value_heads > 0) {
-        num_kv_heads_ = metadata_.num_key_value_heads;
-    } else {
-        num_kv_heads_ = num_heads_;
-    }
-
-    head_dim_ = hidden_size_ / num_heads_;
-
-    if (tier_mgr_) {
-        size_t count = 0;
-        while (tier_mgr_->get_tensor_view("blk." + std::to_string(count) + ".attn_q.weight") != nullptr) {
-            count++;
-        }
-        if (count > 0) {
-            num_layers_ = count;
-        } else {
-            num_layers_ = metadata_.num_hidden_layers > 0 ? metadata_.num_hidden_layers : 4;
-        }
-    } else {
         num_layers_ = metadata_.num_hidden_layers > 0 ? metadata_.num_hidden_layers : 4;
+        num_heads_ = metadata_.num_attention_heads > 0 ? metadata_.num_attention_heads : 4;
+        num_kv_heads_ = metadata_.num_key_value_heads > 0 ? metadata_.num_key_value_heads : num_heads_;
+        head_dim_ = hidden_size_ / num_heads_;
+        vocab_size_ = metadata_.vocab_size > 0 ? metadata_.vocab_size : 32000;
+    } else {
+        // Fast, deterministic dimensions for standalone micro-benchmarks / tests without an external model file
+        hidden_size_ = 256;
+        intermediate_size_ = 512;
+        num_layers_ = 4;
+        num_heads_ = 4;
+        num_kv_heads_ = 4;
+        head_dim_ = hidden_size_ / num_heads_;
+        vocab_size_ = 1000;
     }
 
     // Allocate forward activation buffers
@@ -85,9 +50,12 @@ ForwardPassExecutor::ForwardPassExecutor(
 }
 
 void ForwardPassExecutor::initialize_default_weights() {
-    if (weights_initialized_) return;
+    if (weights_initialized_ || metadata_.is_loaded) {
+        weights_initialized_ = true;
+        return;
+    }
 
-    // Check if parameters already registered by loader
+    // Check if parameters already registered by loader or previous instance
     if (tier_mgr_ && (tier_mgr_->get_tensor_view("output.weight") != nullptr ||
                       tier_mgr_->get_tensor_view("token_embd.weight") != nullptr ||
                       tier_mgr_->get_tensor_view("blk.0.attn_q.weight") != nullptr)) {
@@ -449,6 +417,14 @@ int32_t ForwardPassExecutor::forward_token(
         TensorView* tv_down = tier_mgr_ ? tier_mgr_->get_tensor_view(pfx + "ffn_down.weight") : nullptr;
         DataType dt_down = tv_down ? tv_down->dtype : DataType::FP32;
 
+        // Strict tensor validation if real model is loaded
+        if (metadata_.is_loaded) {
+            if (!wq_raw || !wk_raw || !wv_raw || !wo_raw || !w_gate_raw || !w_up_raw || !w_down_raw) {
+                std::cerr << "[Nexus Engine Error] Required tensor missing for layer " << l << std::endl;
+                return 0;
+            }
+        }
+
         // Pre-Attention RMSNorm: hidden = rmsnorm(hidden)
         TransformerOps::rmsnorm(act_hidden_.data(), attn_norm, dt_attn_norm, act_norm_.data(), hidden_size_, metadata_.rms_norm_eps);
 
@@ -460,7 +436,7 @@ int32_t ForwardPassExecutor::forward_token(
         // RoPE positional embeddings
         TransformerOps::rope(act_q_.data(), act_k_.data(), head_dim_, num_heads_, num_kv_heads_, pos, metadata_.rope_theta);
 
-        // Write K and V into kv_mgr_->write_block(block_id)
+        // Write K and Value into kv_mgr_->write_block(block_id)
         size_t blk_idx = pos / BLOCK_SIZE;
         size_t slot = pos % BLOCK_SIZE;
         if (blk_idx < block_table.size()) {

@@ -21,6 +21,7 @@ struct ModelMetadata {
     bool is_moe = false;
     uint32_t num_experts = 0;
     uint32_t num_experts_per_tok = 0;
+    bool is_loaded = false;
     std::map<std::string, std::string> custom_attributes;
 };
 

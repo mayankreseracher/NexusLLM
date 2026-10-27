@@ -72,9 +72,8 @@ class ContinuousBatchEngine:
     def _fallback_transformer_step(self, token: int, seq_tokens: List[int]) -> int:
         """Mathematical Transformer forward step for standalone Python mode."""
         if np is None:
-            # Pure Python deterministic fallback without numpy dependency
-            val = (abs(token) * 1103515245 + 12345) % 1000
-            return int(val)
+            # Deterministic vocabulary transition without numpy dependency
+            return (token + 1) % 1000 if seq_tokens else 1
 
         dim = 64
         # 1. Embedding lookup

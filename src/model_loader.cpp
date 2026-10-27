@@ -200,6 +200,7 @@ NexusStatus UniversalModelLoader::load_safetensors(const std::string& filepath) 
 
     std::cout << "[UniversalModelLoader] Loaded " << loaded_tensors_.size() 
               << " SafeTensors parameters into Tier 1 Host RAM." << std::endl;
+    metadata_.is_loaded = true;
     return NexusStatus::SUCCESS;
 }
 
@@ -596,6 +597,7 @@ NexusStatus UniversalModelLoader::load_gguf(const std::string& filepath) {
               << metadata_.num_key_value_heads << ", vocab=" 
               << metadata_.vocab_size << ")." << std::endl;
 
+    metadata_.is_loaded = true;
     return NexusStatus::SUCCESS;
 }
 
