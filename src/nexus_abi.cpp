@@ -7,6 +7,7 @@
 #include "quantization.hpp"
 #include "disaggregated_pipeline.hpp"
 #include "transformer_engine.hpp"
+#include "forward_pass.hpp"
 #include "nexus_backend.hpp"
 
 namespace nexus {
@@ -26,6 +27,7 @@ public:
         if (transformer && backend) {
             transformer->set_compute_backend(backend);
         }
+        forward_executor = std::make_unique<nexus::ForwardPassExecutor>(tier_mgr, kv_mgr, loader->get_metadata());
     }
 
     std::shared_ptr<nexus::MemoryTierManager> tier_mgr;
@@ -33,6 +35,7 @@ public:
     std::shared_ptr<nexus::PagedKVCacheManager> kv_mgr;
     std::unique_ptr<nexus::DisaggregatedControlPlane> control_plane;
     std::unique_ptr<nexus::TransformerEngine> transformer;
+    std::unique_ptr<nexus::ForwardPassExecutor> forward_executor;
     std::shared_ptr<nexus::INexusComputeBackend> backend;
 };
 
@@ -139,6 +142,12 @@ NEXUS_API int32_t nexus_load_model_auto(NexusEngineHandle engine, const char* fi
         eng->transformer = std::make_unique<nexus::TransformerEngine>(
             eng->tier_mgr, eng->kv_mgr, meta
         );
+        if (eng->backend) {
+            eng->transformer->set_compute_backend(eng->backend);
+        }
+        eng->forward_executor = std::make_unique<nexus::ForwardPassExecutor>(
+            eng->tier_mgr, eng->kv_mgr, meta
+        );
     }
     return static_cast<int32_t>(status);
 }
@@ -186,10 +195,7 @@ NEXUS_API int32_t nexus_submit_request(NexusEngineHandle engine,
     req->prompt_tokens.assign(prompt_tokens, prompt_tokens + prompt_len);
     req->max_new_tokens = max_new_tokens;
 
-    // Allocate blocks if not cached
-    size_t blocks_needed = (prompt_len + nexus::BLOCK_SIZE - 1) / nexus::BLOCK_SIZE;
-    req->assigned_block_ids = eng->kv_mgr->allocate_blocks(blocks_needed);
-
+    // Submits to control plane which matches prefix and dynamically allocates needed blocks
     eng->control_plane->submit_request(req);
     return 0;
 }
@@ -203,6 +209,10 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
 
     // Continuous Batching Interleaved Schedule (Sarathi-Serve / Orca: chunked prefill + decode in same step)
     auto interleaved = eng->control_plane->schedule_interleaved_iteration(1024);
+    if (eng->forward_executor) {
+        return eng->forward_executor->execute_interleaved_batch(interleaved, *eng->control_plane, out_tokens, max_out);
+    }
+
     int32_t step_count = 0;
 
     // 1. Process chunked prefills in this iteration
@@ -273,6 +283,9 @@ NEXUS_API int32_t nexus_forward_token(NexusEngineHandle engine, int32_t current_
     auto* eng = static_cast<InternalEngine*>(engine);
     size_t blocks_needed = (position + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
     auto blocks = eng->kv_mgr->allocate_blocks(blocks_needed > 0 ? blocks_needed : 1);
+    if (eng->forward_executor) {
+        return eng->forward_executor->forward_token(current_token, position, blocks, temperature);
+    }
     return eng->transformer->forward_token(current_token, position, blocks, temperature);
 }
 
@@ -282,6 +295,9 @@ NEXUS_API int32_t nexus_forward_sequence(NexusEngineHandle engine, const int32_t
     std::vector<int32_t> tokens(prompt_tokens, prompt_tokens + num_tokens);
     size_t blocks_needed = (num_tokens + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
     auto blocks = eng->kv_mgr->allocate_blocks(blocks_needed > 0 ? blocks_needed : 1);
+    if (eng->forward_executor) {
+        return eng->forward_executor->forward_prefill(tokens, blocks, temperature);
+    }
     return eng->transformer->forward_prefill(tokens, blocks, temperature);
 }
 

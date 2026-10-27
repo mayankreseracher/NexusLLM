@@ -24,7 +24,13 @@ PagedKVCacheManager::PagedKVCacheManager(size_t max_blocks, size_t num_layers, s
 }
 
 PagedKVCacheManager::~PagedKVCacheManager() {
-    // Clean up
+    std::lock_guard<std::mutex> lock(radix_mutex_);
+    for (auto& pair : radix_root_->children) {
+        if (pair.second) {
+            release_blocks(pair.second->allocated_block_ids);
+        }
+    }
+    radix_root_->children.clear();
 }
 
 std::vector<int32_t> PagedKVCacheManager::allocate_blocks(size_t num_blocks_needed) {
@@ -156,6 +162,16 @@ void PagedKVCacheManager::insert_prefix(const std::vector<int32_t>& tokens, cons
     node->last_accessed_time = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 
+    // Retain cached blocks so request completion doesn't prematurely release them while held in the prefix tree
+    for (int32_t b : block_ids) {
+        retain_block(b);
+    }
+
+    auto it = radix_root_->children.find(tokens[0]);
+    if (it != radix_root_->children.end()) {
+        release_blocks(it->second->allocated_block_ids);
+    }
+
     // Insert under root child indexed by first token
     radix_root_->children[tokens[0]] = node;
 }
@@ -165,6 +181,14 @@ KVBlock* PagedKVCacheManager::get_block(int32_t block_id) {
         return &block_pool_[block_id];
     }
     return nullptr;
+}
+
+KVBlock* PagedKVCacheManager::read_block(int32_t block_id) {
+    return get_block(block_id);
+}
+
+KVBlock* PagedKVCacheManager::write_block(int32_t block_id) {
+    return get_block(block_id);
 }
 
 size_t PagedKVCacheManager::get_free_blocks_count() const {

@@ -31,7 +31,7 @@ endif
 
 CXXFLAGS += $(SIMD_FLAGS)
 
-SRC = src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/transformer_engine.cpp src/nexus_engine.cpp src/nexus_abi.cpp src/nexus_backend.cpp
+SRC = src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quantization.cpp src/moe_router.cpp src/transformer_engine.cpp src/forward_pass.cpp src/nexus_engine.cpp src/nexus_abi.cpp src/nexus_backend.cpp
 OBJ = $(SRC:.cpp=.o)
 
 all: $(TARGET_LIB) nexus_bench

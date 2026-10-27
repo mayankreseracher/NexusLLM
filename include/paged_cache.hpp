@@ -78,6 +78,10 @@ public:
     // Get block pointer
     KVBlock* get_block(int32_t block_id);
 
+    // Read and Write block accessors for PagedAttention CPU kernel
+    KVBlock* read_block(int32_t block_id);
+    KVBlock* write_block(int32_t block_id);
+
     // Memory stats
     size_t get_free_blocks_count() const;
     size_t get_total_blocks_count() const { return max_blocks_; }
