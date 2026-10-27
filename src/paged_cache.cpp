@@ -79,6 +79,26 @@ void PagedKVCacheManager::release_blocks(const std::vector<int32_t>& block_ids) 
     }
 }
 
+void PagedKVCacheManager::rollback_sequence(const std::vector<int32_t>& block_table, size_t new_length) {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    size_t tokens_accounted = 0;
+    for (size_t blk_idx = 0; blk_idx < block_table.size(); ++blk_idx) {
+        int32_t blk_id = block_table[blk_idx];
+        if (blk_id < 0 || static_cast<size_t>(blk_id) >= max_blocks_) continue;
+        KVBlock& blk = block_pool_[blk_id];
+
+        if (tokens_accounted >= new_length) {
+            blk.tokens_occupied = 0;
+        } else if (tokens_accounted + BLOCK_SIZE <= new_length) {
+            blk.tokens_occupied = BLOCK_SIZE;
+            tokens_accounted += BLOCK_SIZE;
+        } else {
+            blk.tokens_occupied = new_length - tokens_accounted;
+            tokens_accounted = new_length;
+        }
+    }
+}
+
 std::pair<size_t, std::vector<int32_t>> PagedKVCacheManager::match_prefix(const std::vector<int32_t>& prompt_tokens) {
     std::lock_guard<std::mutex> lock(radix_mutex_);
     total_requests_++;

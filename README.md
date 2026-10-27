@@ -75,15 +75,23 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 - **Disaggregated Prefill and Decode (PD Pipeline)**: Decouples prefill scheduling from memory-bandwidth-bound decode across distinct execution queues.
 - **Bounds-Checked KV Block Allocator**: On-demand allocation with reference counting and atomic cancellation to avoid memory leaks.
 
-### 5. Transformer Forward Execution Pipeline
-- **End-to-End Mathematical Computation**:
-  - **Token Embedding Lookup**: Retrieves dense representations from embedding tables.
-  - **RMSNorm (Root Mean Square Normalization)**: Numerically stable normalization before and after attention blocks.
-  - **Q, K, V Matrix-Vector GEMV Projections**: Multi-head and Grouped-Query Attention (GQA) head projections.
-  - **Rotary Position Embeddings (RoPE)**: Rotary position encoding across Query and Key heads for arbitrary context lengths.
-  - **PagedAttention Block Storage & Dot-Product Attention**: Attention scores computed against cached Key/Value blocks with $\frac{1}{\sqrt{d_{head}}}$ scaling, Softmax, and Value reduction.
+### 5. Transformer Forward Execution Pipeline & Speculative Decoding
+- **Full Model Forward Loop Orchestration (`llama_eval` architecture)**:
+  - **Token Embedding Lookup**: Retrieves dense representations with on-the-fly FP32/FP16/Q4_0/Q8_0 dequantization.
+  - **RMSNorm (Root Mean Square Normalization)**: Numerically stable pre- and post-attention normalization (`rms_norm_eps`).
+  - **Q, K, V Matrix-Vector GEMV Projections**: Multi-Head Attention (MHA) and Grouped-Query Attention (GQA) head projections via SIMD quantized kernels (`fused_gemv_q4_0`, `fused_gemv_q8_0`, `fused_gemv_fp16`).
+  - **Rotary Position Embeddings (RoPE)**: High-precision frequency rotation applied to Query and Key heads across arbitrary context windows.
+  - **FlashAttention CPU Tiled Online Softmax ([Dao et al., 2022](https://arxiv.org/abs/2205.14135) / [vLLM](https://arxiv.org/abs/2309.06180) §4.2)**: Cache-tiled attention over physical `KVBlock` pointers with running max $m$, running sum $l$, and accumulator $O$. Operates with $O(1)$ workspace (zero dynamic heap allocations in inner decode loop) and AVX2/NEON fused multiply-accumulate vectorization.
+  - **Attention Output Projection & Residual Connection**: Projects multi-head output through $W_o$ and accumulates into residual stream.
   - **SwiGLU Feed-Forward Network**: SiLU-gated up-projection multiplied element-wise and projected down (`w_down(SiLU(w_gate(x)) * w_up(x))`).
-  - **LM Head & Sampling**: Logits projection and temperature-scaled categorical or greedy argmax sampling.
+  - **Final RMSNorm & LM Head Logits Projection**: Dense matrix-vector projection into vocabulary space.
+  - **Sampling**: Temperature-scaled categorical, top-k/top-p, and greedy argmax sampling.
+- **Speculative Decoding Verification ([Medusa](https://arxiv.org/abs/2401.10774) / [EAGLE-2](https://arxiv.org/abs/2402.12567) / Multi-Token Prediction)**:
+  - Proposes $K$ candidate draft tokens via MTP/Medusa auxiliary heads.
+  - Verifies candidate draft chains against target model forward pass; accepts matching tokens sequentially and emits target model correction on first mismatch.
+  - Executes $O(1)$ physical KV cache sequence rollback (`rollback_sequence`) on rejection, reclaiming discarded tokens without memory leaks.
+- **Continuous Batching Interleaving ([Sarathi-Serve](https://arxiv.org/abs/2308.16369) / Orca)**:
+  - Interleaves active single-token decodes with chunked prefill within a single unified iteration token budget, eliminating Time-Between-Tokens (TBT) jitter.
 - **Dynamic Asynchronous Layer Prefetching**: Layer $l+1$ weights are proactively transferred into Tier 0 working buffers while layer $l$ is executing via alternating double-buffered ping-pong working slots.
 
 ### 6. Hardware Accelerator Backends (Phase 5)

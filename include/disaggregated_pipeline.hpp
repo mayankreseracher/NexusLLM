@@ -53,6 +53,14 @@ public:
     // Pull next batch for Decode worker (continuous iteration-level batching)
     std::vector<std::shared_ptr<InferenceRequest>> schedule_decode_batch(size_t max_batch_size);
 
+    // Interleaved Iteration Schedule for Orca / Sarathi-Serve (arXiv:2308.16369)
+    // Combines active single-token decodes with chunked prefill within a single iteration budget
+    struct InterleavedBatch {
+        std::vector<std::shared_ptr<InferenceRequest>> decode_requests;
+        std::vector<std::pair<std::shared_ptr<InferenceRequest>, size_t>> prefill_chunks;
+    };
+    InterleavedBatch schedule_interleaved_iteration(size_t token_budget);
+
     // Complete prefill phase and dispatch KV transfer packet to decode worker
     void complete_prefill_and_handoff(std::shared_ptr<InferenceRequest> req, uint32_t first_token);
 

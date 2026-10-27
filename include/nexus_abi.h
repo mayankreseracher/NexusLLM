@@ -99,6 +99,25 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
 
 NEXUS_API int32_t nexus_abort_request(NexusEngineHandle engine, const char* request_id);
 
+// Direct Model Forward Pass & Sampling (Embedding -> [RMSNorm -> QKV -> RoPE -> FlashAttention -> Wo -> RMSNorm -> SwiGLU]xL -> FinalRMSNorm -> LM Head -> Sample)
+NEXUS_API int32_t nexus_forward_token(NexusEngineHandle engine, int32_t current_token, size_t position, float temperature);
+NEXUS_API int32_t nexus_forward_sequence(NexusEngineHandle engine, const int32_t* prompt_tokens, size_t num_tokens, float temperature);
+
+// Speculative Decoding Verification (Medusa / EAGLE-2 / MTP)
+NEXUS_API int32_t nexus_step_speculative_verify(
+    NexusEngineHandle engine,
+    int32_t current_token,
+    size_t position,
+    const int32_t* draft_tokens,
+    size_t num_drafts,
+    int32_t* out_accepted_tokens,
+    size_t* out_num_accepted,
+    int32_t* out_correction_token
+);
+
+// Mathematical Verification: Computes max absolute difference between FlashAttention Tiled Online Softmax and Naive Attention
+NEXUS_API float nexus_verify_flash_attention(void);
+
 // Local hardware memory accounting (strictly offline / zero telemetry)
 NEXUS_API void nexus_get_memory_stats(NexusEngineHandle engine, NexusLocalMemoryStats* out_stats);
 

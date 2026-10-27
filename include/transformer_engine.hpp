@@ -23,6 +23,14 @@ struct TransformerLayerWeights {
     const float* w_down = nullptr;
 };
 
+// Speculative Decoding Verification Output (Medusa / EAGLE-2 / MTP)
+struct SpeculativeVerifyResult {
+    std::vector<int32_t> accepted_tokens; // Draft tokens confirmed by target model
+    int32_t bonus_or_correction_token = 0; // Final bonus token (if all accepted) or target correction token
+    size_t num_accepted = 0;               // Count of accepted draft tokens
+    bool all_drafts_accepted = false;      // True if all proposed drafts matched target logits
+};
+
 class TransformerEngine {
 public:
     TransformerEngine(std::shared_ptr<MemoryTierManager> tier_mgr,
@@ -33,7 +41,7 @@ public:
     void initialize_default_weights();
 
     // Full Transformer Forward Pass for a single token at position
-    // Computes: Embedding -> [RMSNorm -> QKV -> RoPE -> PagedAttn -> Wo -> RMSNorm -> SwiGLU]xLayers -> FinalRMSNorm -> Logits -> Sample
+    // Computes: Embedding -> [RMSNorm -> QKV -> RoPE -> FlashAttention -> Wo -> RMSNorm -> SwiGLU]xLayers -> FinalRMSNorm -> Logits -> Sample
     int32_t forward_token(
         int32_t current_token,
         size_t position,
@@ -44,6 +52,32 @@ public:
     // Prefill full sequence of prompt tokens and return next generated token
     int32_t forward_prefill(
         const std::vector<int32_t>& prompt_tokens,
+        const std::vector<int32_t>& block_table,
+        float temperature = 0.0f
+    );
+
+    // Forward evaluate arbitrary token sequence and return logits of final token
+    std::vector<float> forward_sequence_logits(
+        const std::vector<int32_t>& tokens,
+        const std::vector<int32_t>& block_table
+    );
+
+    // Multi-Token Prediction (MTP) / Medusa Draft Proposal (arXiv:2401.10774 / arXiv:2402.12567)
+    // Predicts top-1 candidate draft tokens for subsequent K positions
+    std::vector<int32_t> predict_mtp_draft(
+        int32_t current_token,
+        size_t current_pos,
+        size_t num_draft_tokens
+    );
+
+    // Speculative Decoding Verification Loop (EAGLE-2 / Medusa / MTP)
+    // Verifies proposed draft tokens against target model forward pass.
+    // Automatically accepts matching tokens, emits correction on rejection,
+    // and rolls back KV cache state in O(1) time.
+    SpeculativeVerifyResult forward_speculative_verify(
+        int32_t current_token,
+        size_t position,
+        const std::vector<int32_t>& draft_tokens,
         const std::vector<int32_t>& block_table,
         float temperature = 0.0f
     );

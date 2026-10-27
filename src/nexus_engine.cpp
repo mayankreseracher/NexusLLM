@@ -87,6 +87,41 @@ std::vector<std::shared_ptr<InferenceRequest>> DisaggregatedControlPlane::schedu
     return batch;
 }
 
+DisaggregatedControlPlane::InterleavedBatch DisaggregatedControlPlane::schedule_interleaved_iteration(size_t token_budget) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    InterleavedBatch batch;
+    size_t budget_used = 0;
+
+    // 1. Prioritize active decodes (1 token compute per decode request) to eliminate decode jitter
+    for (auto it = active_decode_pool_.begin(); it != active_decode_pool_.end() && budget_used < token_budget; ++it) {
+        if (!(*it)->is_finished) {
+            batch.decode_requests.push_back(*it);
+            budget_used += 1;
+        }
+    }
+
+    // 2. Fill remaining token budget with chunked prefill (Sarathi-Serve / Orca arXiv:2308.16369)
+    size_t prefill_budget = (budget_used < token_budget) ? (token_budget - budget_used) : 0;
+    size_t prefill_accum = 0;
+
+    while (!pending_prefill_queue_.empty() && prefill_accum < prefill_budget) {
+        auto req = pending_prefill_queue_.front();
+        size_t remaining = req->prompt_tokens.size() - req->processed_tokens;
+        size_t chunk = std::min(remaining, prefill_budget - prefill_accum);
+
+        prefill_accum += chunk;
+        batch.prefill_chunks.push_back({req, chunk});
+        pending_prefill_queue_.pop();
+
+        req->processed_tokens += chunk;
+        if (req->processed_tokens < req->prompt_tokens.size()) {
+            pending_prefill_queue_.push(req); // Re-queue remaining chunk
+        }
+    }
+
+    return batch;
+}
+
 std::vector<std::shared_ptr<InferenceRequest>> DisaggregatedControlPlane::schedule_decode_batch(size_t max_batch_size) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     std::vector<std::shared_ptr<InferenceRequest>> batch;

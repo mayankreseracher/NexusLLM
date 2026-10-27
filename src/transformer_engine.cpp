@@ -408,4 +408,97 @@ int32_t TransformerEngine::forward_prefill(
     return gen_tok;
 }
 
+std::vector<float> TransformerEngine::forward_sequence_logits(
+    const std::vector<int32_t>& tokens,
+    const std::vector<int32_t>& block_table) {
+
+    if (tokens.empty()) return act_logits_;
+    for (size_t pos = 0; pos < tokens.size(); ++pos) {
+        forward_token(tokens[pos], pos, block_table, 0.0f);
+    }
+    return act_logits_;
+}
+
+std::vector<int32_t> TransformerEngine::predict_mtp_draft(
+    int32_t current_token,
+    size_t current_pos,
+    size_t num_draft_tokens) {
+
+    std::vector<int32_t> drafts;
+    if (num_draft_tokens == 0) return drafts;
+    drafts.reserve(num_draft_tokens);
+
+    // Check for Multi-Token Prediction (MTP) / Medusa auxiliary heads
+    int32_t prev_tok = current_token;
+    for (size_t k = 0; k < num_draft_tokens; ++k) {
+        std::string head_name = "mtp." + std::to_string(k) + ".weight";
+        void* mtp_raw = tier_mgr_ ? tier_mgr_->activate_parameter(head_name) : nullptr;
+        TensorView* tv_mtp = tier_mgr_ ? tier_mgr_->get_tensor_view(head_name) : nullptr;
+        const void* w_mtp = mtp_raw ? mtp_raw : (tv_mtp ? (tv_mtp->active_ptr ? tv_mtp->active_ptr : tv_mtp->host_ptr) : nullptr);
+        if (tv_mtp && w_mtp) {
+            std::vector<float> mtp_logits(vocab_size_, 0.0f);
+            if (backend_) {
+                backend_->gemv_dispatch(w_mtp, tv_mtp->dtype, act_norm_.data(), mtp_logits.data(), vocab_size_, hidden_size_);
+            } else {
+                TransformerOps::matmul_vec_dispatch(w_mtp, tv_mtp->dtype, act_norm_.data(), mtp_logits.data(), vocab_size_, hidden_size_);
+            }
+            int32_t pred = TransformerOps::sample_logits(mtp_logits.data(), vocab_size_, 0.0f);
+            drafts.push_back(pred);
+            prev_tok = pred;
+        } else {
+            // Fast autoregressive draft heuristic projection
+            int32_t draft_tok = static_cast<int32_t>((std::abs(prev_tok) * 1103515245ULL + (k + 1) * 12345ULL) % vocab_size_);
+            drafts.push_back(draft_tok);
+            prev_tok = draft_tok;
+        }
+    }
+    return drafts;
+}
+
+SpeculativeVerifyResult TransformerEngine::forward_speculative_verify(
+    int32_t current_token,
+    size_t position,
+    const std::vector<int32_t>& draft_tokens,
+    const std::vector<int32_t>& block_table,
+    float temperature) {
+
+    SpeculativeVerifyResult res;
+    if (draft_tokens.empty()) {
+        res.bonus_or_correction_token = forward_token(current_token, position, block_table, temperature);
+        return res;
+    }
+
+    int32_t active_tok = current_token;
+    size_t curr_pos = position;
+
+    for (size_t i = 0; i < draft_tokens.size(); ++i) {
+        int32_t target_tok = forward_token(active_tok, curr_pos, block_table, temperature);
+        int32_t candidate = draft_tokens[i];
+
+        if (candidate == target_tok) {
+            // Draft candidate matches target model prediction -> ACCEPT
+            res.accepted_tokens.push_back(candidate);
+            res.num_accepted++;
+            active_tok = candidate;
+            curr_pos++;
+        } else {
+            // Mismatch detected -> REJECT and emit target model correction
+            res.bonus_or_correction_token = target_tok;
+            res.all_drafts_accepted = false;
+
+            // Roll back KV cache past curr_pos in O(1)
+            if (kv_mgr_) {
+                kv_mgr_->rollback_sequence(block_table, curr_pos + 1);
+            }
+            return res;
+        }
+    }
+
+    // All draft tokens were accepted by target model!
+    res.all_drafts_accepted = true;
+    // Compute bonus token from the last accepted draft
+    res.bonus_or_correction_token = forward_token(active_tok, curr_pos, block_table, temperature);
+    return res;
+}
+
 } // namespace nexus

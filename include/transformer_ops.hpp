@@ -130,7 +130,9 @@ public:
         }
     }
 
-    // PagedAttention Multi-Head/Grouped-Query Attention Decode
+    // FlashAttention CPU Tiled Online Softmax (§3 of Dao et al., 2022 / vLLM §4.2)
+    // Computes attention directly over Paged KV Cache blocks with O(1) workspace,
+    // maintaining running maximum m, running sum l, and running accumulator O.
     static void paged_attention_decode(
         const float* Q,               // [num_heads, head_dim]
         const std::vector<int32_t>& block_table,
@@ -142,16 +144,170 @@ public:
         size_t head_dim,
         float* attn_out               // Output: [num_heads * head_dim]
     ) {
+        if (num_heads == 0 || num_kv_heads == 0 || head_dim == 0) return;
         size_t kv_mul = num_heads / num_kv_heads;
         float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        size_t total_tokens = seq_len + 1;
 
+        for (size_t h = 0; h < num_heads; ++h) {
+            size_t kv_h = h / kv_mul;
+            const float* q_h = Q + (h * head_dim);
+            float* out_h = attn_out + (h * head_dim);
+
+            // FlashAttention Running State
+            float m = -1e30f;       // Running max
+            float l = 0.0f;         // Running sum of exponentials
+            std::memset(out_h, 0, head_dim * sizeof(float)); // Running output accumulator O
+
+            size_t tokens_processed = 0;
+
+            for (size_t blk_idx = 0; blk_idx < block_table.size() && tokens_processed < total_tokens; ++blk_idx) {
+                int32_t blk_id = block_table[blk_idx];
+                KVBlock* blk = kv_mgr.get_block(blk_id);
+                if (!blk || !blk->key_data || !blk->value_data) {
+                    tokens_processed += BLOCK_SIZE;
+                    continue;
+                }
+
+                size_t valid_in_block = std::min(BLOCK_SIZE, total_tokens - tokens_processed);
+                size_t stride = num_kv_heads * BLOCK_SIZE * head_dim;
+                const float* k_base = blk->key_data + (layer_idx * stride) + (kv_h * BLOCK_SIZE * head_dim);
+                const float* v_base = blk->value_data + (layer_idx * stride) + (kv_h * BLOCK_SIZE * head_dim);
+
+                for (size_t slot = 0; slot < valid_in_block; ++slot) {
+                    const float* k_vec = k_base + (slot * head_dim);
+                    const float* v_vec = v_base + (slot * head_dim);
+
+                    // 1. Compute dot product: Q_h . K_vec
+                    float dot = 0.0f;
+#if defined(NEXUS_HAVE_AVX2)
+                    __m256 vdot = _mm256_setzero_ps();
+                    size_t d = 0;
+                    for (; d + 8 <= head_dim; d += 8) {
+                        __m256 q_v = _mm256_loadu_ps(q_h + d);
+                        __m256 k_v = _mm256_loadu_ps(k_vec + d);
+                        vdot = _mm256_fmadd_ps(q_v, k_v, vdot);
+                    }
+                    alignas(32) float tmp[8];
+                    _mm256_storeu_ps(tmp, vdot);
+                    dot = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+                    for (; d < head_dim; ++d) {
+                        dot += q_h[d] * k_vec[d];
+                    }
+#elif defined(NEXUS_HAVE_ARM_NEON)
+                    float32x4_t vdot = vdupq_n_f32(0.0f);
+                    size_t d = 0;
+                    for (; d + 4 <= head_dim; d += 4) {
+                        float32x4_t q_v = vld1q_f32(q_h + d);
+                        float32x4_t k_v = vld1q_f32(k_vec + d);
+                        vdot = vmlaq_f32(vdot, q_v, k_v);
+                    }
+                    dot = vaddvq_f32(vdot);
+                    for (; d < head_dim; ++d) {
+                        dot += q_h[d] * k_vec[d];
+                    }
+#else
+                    for (size_t d = 0; d < head_dim; ++d) {
+                        dot += q_h[d] * k_vec[d];
+                    }
+#endif
+                    float s = dot * scale;
+
+                    // 2. Online Softmax update (FlashAttention §3)
+                    float m_prev = m;
+                    float m_new = (s > m_prev) ? s : m_prev;
+                    float alpha = std::exp(m_prev - m_new);
+                    float beta = std::exp(s - m_new);
+
+                    l = (l * alpha) + beta;
+                    m = m_new;
+
+                    // 3. Accumulator update: O = (O * alpha) + (beta * V_vec)
+#if defined(NEXUS_HAVE_AVX2)
+                    __m256 valpha = _mm256_set1_ps(alpha);
+                    __m256 vbeta = _mm256_set1_ps(beta);
+                    size_t vd = 0;
+                    for (; vd + 8 <= head_dim; vd += 8) {
+                        __m256 o_v = _mm256_loadu_ps(out_h + vd);
+                        __m256 v_v = _mm256_loadu_ps(v_vec + vd);
+                        o_v = _mm256_fmadd_ps(v_v, vbeta, _mm256_mul_ps(o_v, valpha));
+                        _mm256_storeu_ps(out_h + vd, o_v);
+                    }
+                    for (; vd < head_dim; ++vd) {
+                        out_h[vd] = (out_h[vd] * alpha) + (beta * v_vec[vd]);
+                    }
+#elif defined(NEXUS_HAVE_ARM_NEON)
+                    float32x4_t valpha = vdupq_n_f32(alpha);
+                    float32x4_t vbeta = vdupq_n_f32(beta);
+                    size_t vd = 0;
+                    for (; vd + 4 <= head_dim; vd += 4) {
+                        float32x4_t o_v = vld1q_f32(out_h + vd);
+                        float32x4_t v_v = vld1q_f32(v_vec + vd);
+                        o_v = vmlaq_f32(vmulq_f32(o_v, valpha), v_v, vbeta);
+                        vst1q_f32(out_h + vd, o_v);
+                    }
+                    for (; vd < head_dim; ++vd) {
+                        out_h[vd] = (out_h[vd] * alpha) + (beta * v_vec[vd]);
+                    }
+#else
+                    for (size_t vd = 0; vd < head_dim; ++vd) {
+                        out_h[vd] = (out_h[vd] * alpha) + (beta * v_vec[vd]);
+                    }
+#endif
+                }
+                tokens_processed += valid_in_block;
+            }
+
+            // 4. Final normalization: O = O / l
+            float inv_l = (l > 1e-12f) ? (1.0f / l) : 0.0f;
+#if defined(NEXUS_HAVE_AVX2)
+            __m256 vinv = _mm256_set1_ps(inv_l);
+            size_t fd = 0;
+            for (; fd + 8 <= head_dim; fd += 8) {
+                __m256 o_v = _mm256_loadu_ps(out_h + fd);
+                _mm256_storeu_ps(out_h + fd, _mm256_mul_ps(o_v, vinv));
+            }
+            for (; fd < head_dim; ++fd) {
+                out_h[fd] *= inv_l;
+            }
+#elif defined(NEXUS_HAVE_ARM_NEON)
+            float32x4_t vinv = vdupq_n_f32(inv_l);
+            size_t fd = 0;
+            for (; fd + 4 <= head_dim; fd += 4) {
+                float32x4_t o_v = vld1q_f32(out_h + fd);
+                vst1q_f32(out_h + fd, vmulq_f32(o_v, vinv));
+            }
+            for (; fd < head_dim; ++fd) {
+                out_h[fd] *= inv_l;
+            }
+#else
+            for (size_t fd = 0; fd < head_dim; ++fd) {
+                out_h[fd] *= inv_l;
+            }
+#endif
+        }
+    }
+
+    // Reference PagedAttention Decode (for numerical validation)
+    static void paged_attention_naive(
+        const float* Q,
+        const std::vector<int32_t>& block_table,
+        PagedKVCacheManager& kv_mgr,
+        size_t layer_idx,
+        size_t seq_len,
+        size_t num_heads,
+        size_t num_kv_heads,
+        size_t head_dim,
+        float* attn_out
+    ) {
+        size_t kv_mul = num_heads / num_kv_heads;
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         std::vector<float> scores(seq_len + 1);
 
         for (size_t h = 0; h < num_heads; ++h) {
             size_t kv_h = h / kv_mul;
             const float* q_h = Q + (h * head_dim);
 
-            // Compute attention scores against all past cached tokens
             for (size_t pos = 0; pos <= seq_len; ++pos) {
                 size_t blk_idx = pos / BLOCK_SIZE;
                 size_t slot = pos % BLOCK_SIZE;
@@ -168,7 +324,6 @@ public:
                     continue;
                 }
 
-                // Offset into block: layer_idx * num_kv_heads * BLOCK_SIZE * head_dim
                 size_t stride = num_kv_heads * BLOCK_SIZE * head_dim;
                 const float* k_vec = blk->key_data + (layer_idx * stride) + (kv_h * BLOCK_SIZE * head_dim) + (slot * head_dim);
 
@@ -179,10 +334,8 @@ public:
                 scores[pos] = dot * scale;
             }
 
-            // Softmax over sequence scores
             softmax(scores.data(), seq_len + 1);
 
-            // Weighted sum of Value vectors
             float* out_h = attn_out + (h * head_dim);
             std::memset(out_h, 0, head_dim * sizeof(float));
 

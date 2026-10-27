@@ -201,9 +201,13 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
     if (!engine) return 0;
     auto* eng = static_cast<InternalEngine*>(engine);
 
-    // 1. Process chunked prefill via full transformer forward pass
-    auto prefill_batch = eng->control_plane->schedule_prefill_batch(1024);
-    for (auto& req : prefill_batch) {
+    // Continuous Batching Interleaved Schedule (Sarathi-Serve / Orca: chunked prefill + decode in same step)
+    auto interleaved = eng->control_plane->schedule_interleaved_iteration(1024);
+    int32_t step_count = 0;
+
+    // 1. Process chunked prefills in this iteration
+    for (auto& item : interleaved.prefill_chunks) {
+        auto req = item.first;
         if (req->processed_tokens >= req->prompt_tokens.size()) {
             int32_t first_token = eng->transformer->forward_prefill(
                 req->prompt_tokens,
@@ -211,15 +215,15 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
                 req->temperature
             );
             eng->control_plane->complete_prefill_and_handoff(req, first_token);
+            if (out_tokens && static_cast<size_t>(step_count) < max_out) {
+                out_tokens[step_count++] = first_token;
+            }
         }
     }
 
-    // 2. Process decode batch via full transformer forward pass
-    auto decode_batch = eng->control_plane->schedule_decode_batch(max_out);
-    int32_t step_count = 0;
-
-    for (size_t i = 0; i < decode_batch.size() && static_cast<size_t>(step_count) < max_out; ++i) {
-        auto& req = decode_batch[i];
+    // 2. Process active single-token decodes in this iteration
+    for (size_t i = 0; i < interleaved.decode_requests.size() && static_cast<size_t>(step_count) < max_out; ++i) {
+        auto& req = interleaved.decode_requests[i];
         if (req->is_finished) continue;
 
         int32_t last_token = req->generated_tokens.empty() ? 
@@ -239,7 +243,7 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
             }
         }
 
-        // Run genuine full Transformer forward pass (Embedding -> RMSNorm -> QKV -> RoPE -> PagedAttn -> Wo -> RMSNorm -> SwiGLU -> Logits -> Sample)
+        // Full Transformer forward pass (FlashAttention CPU Tiled Online Softmax + SwiGLU FFN + Sampling)
         int32_t next_token = eng->transformer->forward_token(
             last_token,
             current_pos,
@@ -262,6 +266,107 @@ NEXUS_API int32_t nexus_abort_request(NexusEngineHandle engine, const char* requ
     auto* eng = static_cast<InternalEngine*>(engine);
     eng->control_plane->abort_request(request_id);
     return 0;
+}
+
+NEXUS_API int32_t nexus_forward_token(NexusEngineHandle engine, int32_t current_token, size_t position, float temperature) {
+    if (!engine) return 0;
+    auto* eng = static_cast<InternalEngine*>(engine);
+    size_t blocks_needed = (position + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
+    auto blocks = eng->kv_mgr->allocate_blocks(blocks_needed > 0 ? blocks_needed : 1);
+    return eng->transformer->forward_token(current_token, position, blocks, temperature);
+}
+
+NEXUS_API int32_t nexus_forward_sequence(NexusEngineHandle engine, const int32_t* prompt_tokens, size_t num_tokens, float temperature) {
+    if (!engine || !prompt_tokens || num_tokens == 0) return 0;
+    auto* eng = static_cast<InternalEngine*>(engine);
+    std::vector<int32_t> tokens(prompt_tokens, prompt_tokens + num_tokens);
+    size_t blocks_needed = (num_tokens + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
+    auto blocks = eng->kv_mgr->allocate_blocks(blocks_needed > 0 ? blocks_needed : 1);
+    return eng->transformer->forward_prefill(tokens, blocks, temperature);
+}
+
+NEXUS_API int32_t nexus_step_speculative_verify(
+    NexusEngineHandle engine,
+    int32_t current_token,
+    size_t position,
+    const int32_t* draft_tokens,
+    size_t num_drafts,
+    int32_t* out_accepted_tokens,
+    size_t* out_num_accepted,
+    int32_t* out_correction_token
+) {
+    if (!engine || !draft_tokens || num_drafts == 0) return -1;
+    auto* eng = static_cast<InternalEngine*>(engine);
+
+    std::vector<int32_t> drafts(draft_tokens, draft_tokens + num_drafts);
+    size_t blocks_needed = (position + num_drafts + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
+    auto blocks = eng->kv_mgr->allocate_blocks(blocks_needed > 0 ? blocks_needed : 1);
+
+    auto result = eng->transformer->forward_speculative_verify(current_token, position, drafts, blocks, 0.0f);
+
+    if (out_accepted_tokens) {
+        for (size_t i = 0; i < result.accepted_tokens.size(); ++i) {
+            out_accepted_tokens[i] = result.accepted_tokens[i];
+        }
+    }
+    if (out_num_accepted) {
+        *out_num_accepted = result.num_accepted;
+    }
+    if (out_correction_token) {
+        *out_correction_token = result.bonus_or_correction_token;
+    }
+
+    return 0;
+}
+
+NEXUS_API float nexus_verify_flash_attention(void) {
+    const size_t num_heads = 4;
+    const size_t num_kv_heads = 4;
+    const size_t head_dim = 64;
+    const size_t seq_len = 35; // spans 3 blocks
+
+    nexus::PagedKVCacheManager kv_mgr(16, 1, num_kv_heads, head_dim);
+    size_t blocks_needed = (seq_len + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
+    auto block_table = kv_mgr.allocate_blocks(blocks_needed);
+
+    // Populate KV cache with deterministically varied vectors
+    for (size_t pos = 0; pos <= seq_len; ++pos) {
+        size_t blk_idx = pos / nexus::BLOCK_SIZE;
+        size_t slot = pos % nexus::BLOCK_SIZE;
+        auto* blk = kv_mgr.get_block(block_table[blk_idx]);
+        size_t stride = num_kv_heads * nexus::BLOCK_SIZE * head_dim;
+        for (size_t h = 0; h < num_kv_heads; ++h) {
+            float* k_ptr = blk->key_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
+            float* v_ptr = blk->value_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
+            for (size_t d = 0; d < head_dim; ++d) {
+                k_ptr[d] = std::sin(static_cast<float>(pos * 17 + h * 13 + d));
+                v_ptr[d] = std::cos(static_cast<float>(pos * 19 + h * 7 + d));
+            }
+        }
+    }
+
+    std::vector<float> Q(num_heads * head_dim);
+    for (size_t i = 0; i < Q.size(); ++i) {
+        Q[i] = std::sin(static_cast<float>(i * 3 + 1));
+    }
+
+    std::vector<float> out_flash(num_heads * head_dim, 0.0f);
+    std::vector<float> out_naive(num_heads * head_dim, 0.0f);
+
+    nexus::TransformerOps::paged_attention_decode(
+        Q.data(), block_table, kv_mgr, 0, seq_len, num_heads, num_kv_heads, head_dim, out_flash.data()
+    );
+
+    nexus::TransformerOps::paged_attention_naive(
+        Q.data(), block_table, kv_mgr, 0, seq_len, num_heads, num_kv_heads, head_dim, out_naive.data()
+    );
+
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < out_flash.size(); ++i) {
+        float diff = std::abs(out_flash[i] - out_naive[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    return max_diff;
 }
 
 NEXUS_API void nexus_get_memory_stats(NexusEngineHandle engine, NexusLocalMemoryStats* out_stats) {

@@ -65,6 +65,9 @@ public:
     // Release blocks safely (preventing memory leak bug root cause from arXiv:2506.09713)
     void release_blocks(const std::vector<int32_t>& block_ids);
 
+    // Rollback sequence length in O(1) for speculative decoding rejection (Medusa/EAGLE-2)
+    void rollback_sequence(const std::vector<int32_t>& block_table, size_t new_length);
+
     // Radix Tree Prefix Caching
     // Returns matched token count and existing block IDs
     std::pair<size_t, std::vector<int32_t>> match_prefix(const std::vector<int32_t>& prompt_tokens);
