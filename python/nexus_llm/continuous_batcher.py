@@ -60,6 +60,8 @@ class ContinuousBatchEngine:
         # Submit to native engine if available
         if self.native_engine and getattr(self.native_engine, "_engine_handle", None):
             self.native_engine.submit_request(req_id, prompt_tokens, max_new_tokens)
+            self.active_decode.append(req)
+            return req_id
 
         if req.processed_prompt_tokens >= len(req.prompt_tokens):
             req.first_token_time = time.perf_counter()
