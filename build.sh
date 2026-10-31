@@ -105,6 +105,7 @@ SOURCES="src/memory_tier.cpp src/model_loader.cpp src/paged_cache.cpp src/quanti
 
 echo -e "\n${BOLD}[1/2] Compiling shared library: ${SHARED_OUT}...${NC}"
 $CXX $CXXFLAGS $SIMD_FLAGS $LDFLAGS_SHARED $SOURCES -o "$SHARED_OUT" $LDFLAGS_LIBS
+cp "$SHARED_OUT" python/nexus_llm/ 2>/dev/null || true
 echo -e "${GREEN}✓ Successfully built ${SHARED_OUT}${NC}"
 
 echo -e "\n${BOLD}[2/2] Compiling benchmark executable: nexus_bench...${NC}"

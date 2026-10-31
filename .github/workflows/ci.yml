@@ -36,13 +36,15 @@ jobs:
         run: |
           chmod +x build.sh
           ./build.sh
+          cp libnexus_engine.so python/nexus_llm/ 2>/dev/null || true
 
-      # macOS Build (Apple Silicon)
+      # macOS Build (Apple Silicon & Intel)
       - name: Build Engine (macOS)
         if: runner.os == 'macOS'
         run: |
           chmod +x build.sh
           ./build.sh
+          cp libnexus_engine.dylib python/nexus_llm/ 2>/dev/null || true
 
       # Windows Build
       - name: Build Engine (Windows)
@@ -50,6 +52,11 @@ jobs:
         run: |
           cmake -B build -S .
           cmake --build build --config Release
+          if (Test-Path "build\Release\nexus_engine.dll") { Copy-Item "build\Release\nexus_engine.dll" . }
+          if (Test-Path "build\nexus_engine.dll") { Copy-Item "build\nexus_engine.dll" . }
+          if (Test-Path "build\Release\nexus_bench.exe") { Copy-Item "build\Release\nexus_bench.exe" . }
+          if (Test-Path "build\nexus_bench.exe") { Copy-Item "build\nexus_bench.exe" . }
+          if (Test-Path "nexus_engine.dll") { Copy-Item "nexus_engine.dll" python\nexus_llm\ }
 
       # Run C++ Standalone Benchmark
       - name: Run C++ Native Benchmark (POSIX)
@@ -57,11 +64,30 @@ jobs:
         run: |
           LD_LIBRARY_PATH=. DYLD_LIBRARY_PATH=. ./nexus_bench
 
+      - name: Run C++ Native Benchmark (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $env:PATH = "$(Get-Location);" + $env:PATH
+          .\nexus_bench.exe
+
       # Install Python Package & Run Test Suite
       - name: Install Python Package
         run: |
           pip install -e .
 
-      - name: Run Python Unit Tests
+      - name: Run Python Unit Tests (POSIX)
+        if: runner.os != 'Windows'
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}
         run: |
-          python -m unittest discover -s tests
+          python -m unittest discover -s tests -v
+
+      - name: Run Python Unit Tests (Windows)
+        if: runner.os == 'Windows'
+        env:
+          PYTHONPATH: ${{ github.workspace }}\python;${{ github.workspace }}
+        run: |
+          $env:PATH = "$(Get-Location);$(Get-Location)\build;$(Get-Location)\build\Release;" + $env:PATH
+          python -m unittest discover -s tests -v

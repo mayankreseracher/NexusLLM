@@ -57,6 +57,91 @@ class NexusLocalStats:
     pcie_bandwidth_gbps: float
     prefix_cache_hit_rate: float
 
+def find_nexus_library(dll_path: Optional[str] = None) -> str:
+    """
+    Locates the compiled native C++ engine library across platforms:
+    - Windows: nexus_engine.dll
+    - Linux: libnexus_engine.so
+    - macOS: libnexus_engine.dylib
+    """
+    if dll_path is not None and os.path.exists(dll_path):
+        resolved = str(Path(dll_path).resolve())
+        if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(str(Path(resolved).parent.resolve()))
+            except Exception:
+                pass
+        return resolved
+
+    searched_paths: List[str] = []
+    # 1. Check explicit environment variable override
+    env_path = os.environ.get("NEXUS_LIB_PATH")
+    if env_path and os.path.exists(env_path):
+        resolved = str(Path(env_path).resolve())
+        if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(str(Path(resolved).parent.resolve()))
+            except Exception:
+                pass
+        return resolved
+
+    pkg_dir = Path(__file__).resolve().parent
+    repo_dir = pkg_dir.parent.parent
+    cwd = Path.cwd()
+
+    names = ["nexus_engine.dll", "libnexus_engine.so", "libnexus_engine.dylib"]
+    search_dirs = [
+        repo_dir,
+        repo_dir / "build",
+        repo_dir / "build" / "Release",
+        repo_dir / "build" / "Debug",
+        pkg_dir,
+        pkg_dir.parent,
+        cwd,
+        cwd / "build",
+        cwd / "build" / "Release",
+        Path("/usr/local/lib"),
+        Path("/usr/lib"),
+    ]
+
+    # Walk upward directories to locate root build folder if installed inside a virtualenv
+    curr = pkg_dir
+    for _ in range(5):
+        curr = curr.parent
+        search_dirs.append(curr)
+        search_dirs.append(curr / "build")
+        search_dirs.append(curr / "build" / "Release")
+
+    for d in search_dirs:
+        for name in names:
+            candidate = d / name
+            candidate_str = str(candidate.resolve())
+            if candidate_str not in searched_paths:
+                searched_paths.append(candidate_str)
+            if candidate.exists():
+                if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(str(candidate.parent.resolve()))
+                    except Exception:
+                        pass
+                return candidate_str
+
+    found = ctypes.util.find_library("nexus_engine")
+    if found:
+        return found
+
+    raise RuntimeError(
+        "[NexusLLM Fatal] Native C++ engine library (libnexus_engine.so / nexus_engine.dll / libnexus_engine.dylib) "
+        "could not be found on host system.\n"
+        "Searched paths:\n" +
+        "\n".join(f"  - {p}" for p in searched_paths[:15]) +
+        "\n\nTo build the native engine, execute:\n"
+        "  Linux/macOS: ./build.sh  or  make\n"
+        "  Windows:     build.bat\n"
+        "  CMake:       cmake -B build && cmake --build build\n"
+        "Or set the NEXUS_LIB_PATH environment variable to the compiled library file."
+    )
+
 class NexusNativeEngine:
     def __init__(self, tier0_mb: int = 512, tier1_mb: int = 4096, max_kv_blocks: int = 4096, dll_path: Optional[str] = None):
         self.tier0_bytes = tier0_mb * 1024 * 1024
@@ -65,71 +150,10 @@ class NexusNativeEngine:
         self._lib = None
         self._engine_handle = None
 
-        searched_paths: List[str] = []
-        if dll_path is None:
-            # 1. Check explicit environment variable override
-            env_path = os.environ.get("NEXUS_LIB_PATH")
-            if env_path and os.path.exists(env_path):
-                dll_path = env_path
-            else:
-                pkg_dir = Path(__file__).resolve().parent
-                repo_dir = pkg_dir.parent.parent
-                cwd = Path.cwd()
-
-                names = ["nexus_engine.dll", "libnexus_engine.so", "libnexus_engine.dylib"]
-                search_dirs = [
-                    repo_dir,
-                    repo_dir / "build",
-                    repo_dir / "build" / "Release",
-                    repo_dir / "build" / "Debug",
-                    pkg_dir,
-                    pkg_dir.parent,
-                    cwd,
-                    cwd / "build",
-                    cwd / "build" / "Release",
-                    Path("/usr/local/lib"),
-                    Path("/usr/lib"),
-                ]
-
-                # Walk upward directories to locate root build folder if installed inside a virtualenv
-                curr = pkg_dir
-                for _ in range(5):
-                    curr = curr.parent
-                    search_dirs.append(curr)
-                    search_dirs.append(curr / "build")
-
-                for d in search_dirs:
-                    for name in names:
-                        candidate = d / name
-                        candidate_str = str(candidate.resolve())
-                        if candidate_str not in searched_paths:
-                            searched_paths.append(candidate_str)
-                        if candidate.exists():
-                            dll_path = candidate_str
-                            break
-                    if dll_path:
-                        break
-
-                if dll_path is None:
-                    found = ctypes.util.find_library("nexus_engine")
-                    if found:
-                        dll_path = found
-
-        if not dll_path or not os.path.exists(dll_path):
-            raise RuntimeError(
-                "[NexusLLM Fatal] Native C++ engine library (libnexus_engine.so / nexus_engine.dll / libnexus_engine.dylib) "
-                "could not be found on host system.\n"
-                "Searched paths:\n" +
-                "\n".join(f"  - {p}" for p in searched_paths[:12]) +
-                "\n\nTo build the native engine, execute:\n"
-                "  Linux/macOS: ./build.sh  or  make\n"
-                "  Windows:     build.bat\n"
-                "  CMake:       cmake -B build && cmake --build build\n"
-                "Or set the NEXUS_LIB_PATH environment variable to the compiled library file."
-            )
+        lib_file = find_nexus_library(dll_path)
 
         try:
-            self._lib = ctypes.CDLL(dll_path)
+            self._lib = ctypes.CDLL(lib_file)
             self._setup_abi()
             self._engine_handle = self._lib.nexus_create_engine(
                 ctypes.c_size_t(self.tier0_bytes),

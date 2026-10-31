@@ -1,10 +1,21 @@
 import unittest
 import ctypes
 import math
+import sys
 from pathlib import Path
 
 repo_root = Path(__file__).resolve().parent.parent
-dll_path = repo_root / "nexus_engine.dll"
+python_dir = repo_root / "python"
+for p in [str(python_dir), str(repo_root), str(repo_root.parent)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from nexus_llm.bindings import find_nexus_library
+except ImportError:
+    from nexus_engine.python.nexus_llm.bindings import find_nexus_library
+
+dll_path = find_nexus_library()
 
 class TestForwardPassOrchestration(unittest.TestCase):
     def setUp(self):
