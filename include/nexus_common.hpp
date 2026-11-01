@@ -26,6 +26,9 @@
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
     #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #include <windows.h>
 #elif defined(__APPLE__) && defined(__MACH__)
     #define NEXUS_PLATFORM_MACOS 1

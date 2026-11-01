@@ -51,7 +51,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cmake -B build -S .
-          cmake --build build --config Release
+          cmake --build build --config Release --verbose
           if (Test-Path "build\Release\nexus_engine.dll") { Copy-Item "build\Release\nexus_engine.dll" . }
           if (Test-Path "build\nexus_engine.dll") { Copy-Item "build\nexus_engine.dll" . }
           if (Test-Path "build\Release\nexus_bench.exe") { Copy-Item "build\Release\nexus_bench.exe" . }
@@ -67,8 +67,8 @@ jobs:
       - name: Run C++ Native Benchmark (Windows)
         if: runner.os == 'Windows'
         run: |
-          $env:PATH = "$(Get-Location);" + $env:PATH
-          .\nexus_bench.exe
+          $env:PATH = "$(Get-Location);$(Get-Location)\build;$(Get-Location)\build\Release;" + $env:PATH
+          if (Test-Path ".\nexus_bench.exe") { .\nexus_bench.exe } elseif (Test-Path "build\Release\nexus_bench.exe") { .\build\Release\nexus_bench.exe }
 
       # Install Python Package & Run Test Suite
       - name: Install Python Package
