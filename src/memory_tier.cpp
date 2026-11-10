@@ -2,6 +2,26 @@
 #include <iostream>
 #include <algorithm>
 
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+    typedef HMODULE NexusDLRHandle;
+    #define NEXUS_DLR_LOAD(name) LoadLibraryA(name)
+    #define NEXUS_DLR_SYM(handle, sym) GetProcAddress((HMODULE)handle, sym)
+    #define NEXUS_DLR_FREE(handle) FreeLibrary((HMODULE)handle)
+#else
+    #include <dlfcn.h>
+    typedef void* NexusDLRHandle;
+    #define NEXUS_DLR_LOAD(name) dlopen(name, RTLD_LAZY)
+    #define NEXUS_DLR_SYM(handle, sym) dlsym(handle, sym)
+    #define NEXUS_DLR_FREE(handle) dlclose(handle)
+#endif
+
 namespace nexus {
 
 MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_capacity_bytes)
@@ -61,6 +81,25 @@ MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_c
         working_slots_[i].in_use.store(false);
     }
 
+    // DAK: Register Host RAM pool for Unified Virtual Addressing (UVA) & TMA direct DMA
+    NexusDLRHandle hCudart = nullptr;
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    hCudart = NEXUS_DLR_LOAD("cudart64_12.dll");
+    if (!hCudart) hCudart = NEXUS_DLR_LOAD("cudart64_11.dll");
+#else
+    hCudart = NEXUS_DLR_LOAD("libcudart.so.12");
+    if (!hCudart) hCudart = NEXUS_DLR_LOAD("libcudart.so");
+#endif
+    if (hCudart) {
+        typedef int (*pfn_cudaHostRegister)(void*, size_t, unsigned int);
+        auto f_reg = (pfn_cudaHostRegister)NEXUS_DLR_SYM(hCudart, "cudaHostRegister");
+        if (f_reg && tier1_raw_pool_ && tier1_capacity_ > 0) {
+            // cudaHostRegisterMapped (0x02) | cudaHostRegisterPortable (0x01)
+            f_reg(tier1_raw_pool_, tier1_capacity_, 0x03);
+        }
+        NEXUS_DLR_FREE(hCudart);
+    }
+
     // Launch background prefetch worker thread
     prefetch_thread_ = std::thread(&MemoryTierManager::prefetch_worker_loop, this);
 }
@@ -70,6 +109,24 @@ MemoryTierManager::~MemoryTierManager() {
     prefetch_cv_.notify_all();
     if (prefetch_thread_.joinable()) {
         prefetch_thread_.join();
+    }
+
+    // DAK: Unregister Host RAM pool from CUDA UVA
+    NexusDLRHandle hCudart = nullptr;
+#if defined(NEXUS_PLATFORM_WINDOWS)
+    hCudart = NEXUS_DLR_LOAD("cudart64_12.dll");
+    if (!hCudart) hCudart = NEXUS_DLR_LOAD("cudart64_11.dll");
+#else
+    hCudart = NEXUS_DLR_LOAD("libcudart.so.12");
+    if (!hCudart) hCudart = NEXUS_DLR_LOAD("libcudart.so");
+#endif
+    if (hCudart) {
+        typedef int (*pfn_cudaHostUnregister)(void*);
+        auto f_unreg = (pfn_cudaHostUnregister)NEXUS_DLR_SYM(hCudart, "cudaHostUnregister");
+        if (f_unreg && tier1_raw_pool_) {
+            f_unreg(tier1_raw_pool_);
+        }
+        NEXUS_DLR_FREE(hCudart);
     }
 
 #if defined(NEXUS_PLATFORM_WINDOWS)

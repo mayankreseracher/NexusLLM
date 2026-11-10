@@ -46,6 +46,8 @@ elseif(UNIX)
 endif()
 
 # Core dynamic library
+set_source_files_properties(src/dak_offload.cu PROPERTIES LANGUAGE CXX)
+
 add_library(nexus_engine SHARED
     src/memory_tier.cpp
     src/model_loader.cpp
@@ -57,6 +59,7 @@ add_library(nexus_engine SHARED
     src/nexus_engine.cpp
     src/nexus_abi.cpp
     src/nexus_backend.cpp
+    src/dak_offload.cu
 )
 
 target_include_directories(nexus_engine PUBLIC include)

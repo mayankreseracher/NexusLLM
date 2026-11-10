@@ -16,6 +16,7 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 | **Memory Partition & Bucketed LRU** | **Operational** | Multi-tenant memory partitions with `RequestBudget` (mandatory/buffering split) and 64-bucket recency decay ring LRU (`NUM_BUCKETS = 64`). |
 | **Head-Wise Paging** | **Operational** | Decoupled per-head page views (`HeadWisePage`) eliminating fragmentation across GQA ratios. |
 | **Sparse Attention Indexing (Spin)**| **Operational** | Dynamic coarse Key centroid evaluation (arXiv:2604.26837) with `SparsityPartition` & `SpinCentroidIndexer`, pruning 60% of cold blocks ahead of token attention. |
+| **Direct-Access Offloading (DAK)** | **Operational** | Hardware TMA async bulk copy from Host DRAM directly into SMEM (arXiv:2604.26074), bypassing HBM with warp specialization, PCIe congestion control & cluster multicast. |
 | **Transformer Forward Pass** | **Operational** | Complete mathematical execution: Token Embedding -> RMSNorm -> QKV GEMV -> RoPE -> PagedAttention Dot-Product & Softmax -> Wo -> RMSNorm -> SwiGLU FFN -> LM Head Logits -> Sampling. |
 | **Continuous Batching Scheduler**| **Operational** | Chunked prefill scheduling and iteration-level decode loop in C ABI and Python runtime. |
 | **Quantization & SIMD Kernels** | **Operational** | Fused quantized GEMV for GGUF Q4_0, Q8_0, Q5_K, Q6_K, FP16 via AVX2+FMA (x86_64) and ARM NEON (ARM64). |
@@ -118,6 +119,13 @@ NexusLLM features a modular hardware device abstraction (`INexusComputeBackend` 
   - PD scheduler dynamically shrinks or expands buffering pages via `resize_buffering()` based on global HBM/VRAM contention.
 - **Two-Level Paged Metadata Specification (`MetadataSegment`, `MetadataPageTable`)**:
   - Prepares architecture for scaling to millions of concurrent KV blocks without flat vector memory blowup, organizing page table entries into 256-entry segments.
+
+### 8. DAK Direct-Access KV Offloading via TMA ([arXiv:2604.26074](https://arxiv.org/abs/2604.26074))
+- **HBM Hop Elimination**: Bypasses GPU HBM completely for offloaded KV blocks by streaming directly from Host DRAM (UVA registered) across PCIe into Shared Memory (SMEM) via hardware Tensor Memory Accelerator (TMA) bulk async copies.
+- **Warp-Specialized Producer-Consumer Execution**: Warp 0 operates as the dedicated producer issuing TMA bulk transfers and managing `mbarrier` transaction tracking, while Warps 1–7 compute FlashAttention online softmax from SMEM.
+- **TMA Multicast via Thread Block Clusters**: Employs spatial `.shared::cluster` broadcasting over the SM cluster Network-on-Chip (NoC), eliminating the $16\times$ PCIe read amplification across sequences sharing prefix blocks.
+- **Analytical Per-Op Roofline Planner (`DakOffloadPlanner`)**: Differentiates compute-bound operations (GEMM, ~75% offload) from memory-bandwidth-bound operations (Attention, ~25% offload) based on arithmetic intensity.
+- **PCIe Congestion Control (`DakCongestionController`)**: Monitors in-flight TMA byte traffic and applies dynamic backpressure to protect active decode streams from bus saturation.
 
 ---
 

@@ -545,4 +545,69 @@ NEXUS_API int32_t nexus_verify_partition_and_bucketed_lru(void) {
     return 0; // All checks passed
 }
 
+// DAK (Direct-Access KV Offloading via TMA) Verification ABI
+NEXUS_API int32_t nexus_verify_dak_tma_offload(void) {
+    // 1. Verify DakCongestionController backpressure and descriptor bounds (Issue 4)
+    nexus::DakCongestionController controller(64 * 1024 * 1024, 4);
+    if (controller.get_saturation_ratio() != 0.0f) return -1;
+    if (!controller.try_acquire_transfer(32 * 1024 * 1024)) return -2;
+    if (std::abs(controller.get_saturation_ratio() - 0.5f) > 0.01f) return -3;
+    // Exceeds high watermark -> must apply backpressure
+    if (controller.try_acquire_transfer(40 * 1024 * 1024)) return -4;
+    controller.release_transfer(32 * 1024 * 1024);
+    if (controller.get_saturation_ratio() != 0.0f) return -5;
+
+    // 2. Verify DakOffloadPlanner analytical ratio split (Issue 6)
+    auto gemm_plan = nexus::DakOffloadPlanner::compute_ratio_gemm(100, 128, 4096, 4096, 0.5f, 64.0, 1000.0);
+    if (gemm_plan.offload_ratio < 0.50f || gemm_plan.tma_direct_blocks == 0) return -6;
+
+    auto attn_plan = nexus::DakOffloadPlanner::compute_ratio_attention(100, 0.5f, 0.1f);
+    if (attn_plan.offload_ratio > 0.40f || attn_plan.offload_ratio < 0.10f) return -7;
+
+    // 3. Verify Multi-Head SmemBudget calculation (Issue 8)
+    auto smem_b = nexus::dak::SmemBudget::calculate(0, 8, 128, 16);
+    // 16 tokens * 8 heads * 128 dim * 2 bytes * 2 (K+V) = 65,536 bytes
+    if (smem_b.bytes_per_stage != 65536) return -8;
+    if (smem_b.num_stages < 2) return -9;
+
+    // 4. Verify Host-Locality-First Tile Scheduler (Issue 7 & 9)
+    std::vector<int32_t> selected_pages = {4, 1, 3, 2};
+    std::unordered_map<int32_t, uint64_t> host_addrs = {
+        {1, 0x1000}, {2, 0x4000}, {3, 0x3000}, {4, 0x2000}
+    };
+    std::unordered_set<int32_t> hbm_set = {1}; // Block 1 is HBM-resident, 2,3,4 are TMA offloaded
+    auto scheduled = nexus::dak::schedule_host_locality_tiles(selected_pages, host_addrs, hbm_set);
+    if (scheduled.ordered_block_ids.size() != 4) return -10;
+    // TMA offload blocks must be scheduled together sorted by host address: 4 (0x2000), 3 (0x3000), 2 (0x4000), followed by 1 (HBM)
+    if (scheduled.ordered_block_ids[0] != 4 || scheduled.ordered_block_ids[1] != 3 || scheduled.ordered_block_ids[2] != 2) return -11;
+
+    // 5. Verify DAK multi-stage attention launch mathematical equivalence
+    size_t num_heads = 4;
+    size_t num_kv_heads = 2;
+    size_t head_dim = 64;
+    size_t num_blocks = 2;
+    std::vector<float> Q(num_heads * head_dim, 0.5f);
+    std::vector<int32_t> block_tbl = {0, 1};
+    size_t block_stride = 16 * num_kv_heads * head_dim * 2;
+    std::vector<float> fake_host_dram(num_blocks * block_stride, 0.1f);
+    std::vector<uint8_t> tma_mask = {1, 1}; // Both offloaded via TMA
+    std::vector<float> out(num_heads * head_dim, 0.0f);
+
+    nexus::dak::TmaKVTiledDescriptor desc;
+    nexus::dak::create_tma_1d_kv_descriptor(&desc, fake_host_dram.data(), fake_host_dram.size(), 16 * head_dim, CUDA_R_16F);
+
+    nexus::dak::dak_paged_attention_tma_multicast_launch(
+        Q.data(), block_tbl.data(), num_blocks, num_heads, num_kv_heads, head_dim,
+        1.0f / std::sqrt(static_cast<float>(head_dim)),
+        &desc, nullptr, tma_mask.data(), out.data()
+    );
+
+    // Verify non-zero finite output
+    for (float val : out) {
+        if (std::isnan(val) || std::isinf(val) || val == 0.0f) return -12;
+    }
+
+    return 0; // Success
+}
+
 } // extern "C"

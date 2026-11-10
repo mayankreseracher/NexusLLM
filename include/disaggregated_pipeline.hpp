@@ -2,6 +2,7 @@
 
 #include "nexus_common.hpp"
 #include "paged_cache.hpp"
+#include "memory_tier.hpp"
 #include <queue>
 #include <future>
 
@@ -70,11 +71,20 @@ public:
     // Abort request safely and immediately reclaim blocks (fixing bug root cause from arXiv:2506.09713)
     void abort_request(const std::string& request_id);
 
+    // DAK PCIe Congestion Control Integration (throttles prefill under TMA contention)
+    void set_congestion_controller(std::shared_ptr<DakCongestionController> controller) {
+        congestion_controller_ = controller;
+    }
+    std::shared_ptr<DakCongestionController> get_congestion_controller() const {
+        return congestion_controller_;
+    }
+
     size_t get_active_prefill_count() const;
     size_t get_active_decode_count() const;
 
 private:
     std::shared_ptr<PagedKVCacheManager> kv_mgr_;
+    std::shared_ptr<DakCongestionController> congestion_controller_;
 
     mutable std::mutex queue_mutex_;
     std::queue<std::shared_ptr<InferenceRequest>> pending_prefill_queue_;
