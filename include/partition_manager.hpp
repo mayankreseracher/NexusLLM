@@ -333,6 +333,8 @@ public:
                     int32_t victim = lru_.evict_next();
                     if (victim >= 0) {
                         allocated_blocks_.erase(victim);
+                        auto it = std::find(allocation_order_.begin(), allocation_order_.end(), victim);
+                        if (it != allocation_order_.end()) allocation_order_.erase(it);
                         to_evict.push_back(victim);
                     }
                 }
@@ -363,6 +365,8 @@ public:
                     int32_t victim = lru_.evict_next();
                     if (victim >= 0) {
                         allocated_blocks_.erase(victim);
+                        auto it = std::find(allocation_order_.begin(), allocation_order_.end(), victim);
+                        if (it != allocation_order_.end()) allocation_order_.erase(it);
                         to_evict.push_back(victim);
                     }
                 }
@@ -384,30 +388,57 @@ public:
                 allocation_order_.push_back(b);
                 lru_.record_access(b, 1);
             }
-            update_pins_locked();
+            // Incremental pinning: newly allocated blocks are the most recent;
+            // pin them if mandatory_pages > 0 and unpin oldest mandatory if window shifted
+            if (budget_.mandatory_pages > 0) {
+                for (int32_t b : blocks) {
+                    lru_.pin(b);
+                }
+                // If allocation order now exceeds mandatory_pages, unpin anything pushed out of mandatory zone
+                if (allocation_order_.size() > budget_.mandatory_pages) {
+                    size_t unpin_count = allocation_order_.size() - budget_.mandatory_pages;
+                    for (size_t i = 0; i < unpin_count; ++i) {
+                        lru_.unpin(allocation_order_[i]);
+                    }
+                }
+            }
         }
         return blocks;
     }
 
-    // O(1) release using std::unordered_set membership and full removal from LRU to prevent double-free
+    // O(1) release using std::unordered_set membership, full LRU removal, and O(N+M) allocation_order_ pruning
     void release_blocks(const std::vector<int32_t>& block_ids) {
-        if (kv_mgr_) {
-            kv_mgr_->release_blocks(block_ids);
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (int32_t b : block_ids) {
-            allocated_blocks_.erase(b);
-            lru_.remove(b); // Fully remove from LRU ring to prevent double-free
-        }
-        // Remove from allocation order
-        for (auto it = allocation_order_.begin(); it != allocation_order_.end(); ) {
-            if (std::find(block_ids.begin(), block_ids.end(), *it) != block_ids.end()) {
-                it = allocation_order_.erase(it);
-            } else {
-                ++it;
+        std::vector<int32_t> to_release;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::unordered_set<int32_t> release_set(block_ids.begin(), block_ids.end());
+            for (int32_t b : block_ids) {
+                if (allocated_blocks_.erase(b)) {
+                    lru_.remove(b); // Fully remove from LRU ring
+                    lru_.unpin(b);  // Unpin immediately
+                    to_release.push_back(b);
+                }
+            }
+            // Hash-set lookup: O(N + M) instead of O(N * M)
+            for (auto it = allocation_order_.begin(); it != allocation_order_.end(); ) {
+                if (release_set.count(*it)) {
+                    it = allocation_order_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            // Re-pin the most recent mandatory_pages after removal
+            size_t to_pin = std::min<size_t>(budget_.mandatory_pages, allocation_order_.size());
+            for (size_t i = 0; i < to_pin; ++i) {
+                size_t idx = allocation_order_.size() - 1 - i;
+                lru_.pin(allocation_order_[idx]);
             }
         }
-        update_pins_locked();
+
+        // Release in underlying manager outside partition lock
+        if (!to_release.empty() && kv_mgr_) {
+            kv_mgr_->release_blocks(to_release);
+        }
     }
 
     // Resolves head-wise page descriptors with verified KVBlock layout offsets
