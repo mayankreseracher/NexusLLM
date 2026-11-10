@@ -71,7 +71,7 @@ fi
 echo -e "${CYAN}[Compiler]${NC} Using: ${BOLD}${CXX}${NC}"
 
 # Determine compiler & linker flags based on platform and raw performance capabilities
-CXXFLAGS="-O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -pthread -fopenmp"
+CXXFLAGS="-O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -pthread"
 
 if [ "$OS" = "Darwin" ]; then
     SHARED_OUT="libnexus_engine.dylib"
@@ -84,7 +84,8 @@ if [ "$OS" = "Darwin" ]; then
         SIMD_FLAGS="-mavx2 -mfma"
     fi
 else
-    # Linux
+    # Linux supports -fopenmp via GCC/Clang out of the box
+    CXXFLAGS="$CXXFLAGS -fopenmp"
     SHARED_OUT="libnexus_engine.so"
     LDFLAGS_SHARED="-shared"
     LDFLAGS_LIBS="-ldl -pthread"

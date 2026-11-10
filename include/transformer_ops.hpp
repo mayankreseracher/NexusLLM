@@ -397,8 +397,8 @@ public:
         }
     }
 
-    // Sampling: Greedy argmax if temp <= 0.01, otherwise top-1 / categorical
-    static int32_t sample_logits(const float* logits, size_t vocab_size, float temperature = 0.0f) {
+    // Sampling: Greedy argmax if temp <= 0.01, otherwise top-k/top-p/stochastic categorical sampling
+    static int32_t sample_logits(const float* logits, size_t vocab_size, float temperature = 0.0f, float top_p = 0.95f, int32_t top_k = 40) {
         if (vocab_size == 0) return 0;
         if (temperature <= 0.01f) {
             // Greedy Argmax
@@ -413,23 +413,67 @@ public:
             return best_id;
         }
 
-        // Temperature-scaled softmax
+        // 1. Temperature-scaled probabilities
         std::vector<float> probs(logits, logits + vocab_size);
         for (size_t i = 0; i < vocab_size; ++i) {
             probs[i] /= temperature;
         }
         softmax(probs.data(), vocab_size);
 
-        // Deterministic top-1 above probability threshold
-        int32_t best_id = 0;
-        float max_p = probs[0];
-        for (size_t i = 1; i < vocab_size; ++i) {
-            if (probs[i] > max_p) {
-                max_p = probs[i];
-                best_id = static_cast<int32_t>(i);
+        // 2. Top-K filtering
+        std::vector<std::pair<float, int32_t>> indexed_probs;
+        indexed_probs.reserve(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i) {
+            if (probs[i] > 1e-6f) {
+                indexed_probs.push_back({probs[i], static_cast<int32_t>(i)});
             }
         }
-        return best_id;
+
+        if (indexed_probs.empty()) return 0;
+
+        size_t effective_k = (top_k > 0 && static_cast<size_t>(top_k) < indexed_probs.size()) 
+                           ? static_cast<size_t>(top_k) 
+                           : indexed_probs.size();
+
+        std::partial_sort(indexed_probs.begin(),
+                          indexed_probs.begin() + effective_k,
+                          indexed_probs.end(),
+                          [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
+                              return a.first > b.first;
+                          });
+
+        indexed_probs.resize(effective_k);
+
+        // 3. Top-P (Nucleus) truncation
+        float cumsum = 0.0f;
+        size_t cutoff = indexed_probs.size();
+        for (size_t i = 0; i < indexed_probs.size(); ++i) {
+            cumsum += indexed_probs[i].first;
+            if (cumsum >= top_p && i > 0) {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        indexed_probs.resize(cutoff);
+
+        // 4. Renormalize remaining probabilities
+        float sum_p = 0.0f;
+        for (const auto& p : indexed_probs) sum_p += p.first;
+        if (sum_p <= 0.0f) return indexed_probs[0].second;
+
+        // 5. Stochastic sampling with deterministic linear congruential fallback generator
+        static thread_local uint64_t rng_state = 13374269;
+        rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
+        float r = static_cast<float>((rng_state >> 32) & 0xFFFFFF) / 16777216.0f * sum_p;
+
+        float acc = 0.0f;
+        for (const auto& p : indexed_probs) {
+            acc += p.first;
+            if (r <= acc) {
+                return p.second;
+            }
+        }
+        return indexed_probs.back().second;
     }
 };
 
