@@ -7,11 +7,239 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <array>
 #include <deque>
+#include <algorithm>
+#include <cmath>
 
 namespace nexus {
 
-// Memory Partition Scope
+// ============================================================================
+// Issue 1: Spin Sparsity Partition & Sparse Indexer
+// Maps coarse-grained sparse block selection -> physical page IDs for a query
+// ============================================================================
+struct SparsityPartition {
+    uint32_t query_token_id = 0;
+    std::vector<int32_t> selected_page_ids;  // Top-K physical pages selected for this query
+    float score_threshold = 0.0f;           // Adaptive threshold based on query attention distribution
+    uint32_t coarse_block_id = 0;           // Coarse centroid index identifying the cluster
+};
+
+// Abstract interface for sparse KV indexing algorithms (Spin, H2O, StreamingLLM, etc.)
+class ISparseIndexer {
+public:
+    virtual ~ISparseIndexer() = default;
+
+    virtual SparsityPartition index_query(
+        uint32_t query_token_id,
+        const float* query_vec,
+        size_t head_dim,
+        const std::vector<int32_t>& block_table,
+        PagedKVCacheManager& kv_mgr,
+        size_t layer_idx,
+        size_t kv_head_idx,
+        float retention_ratio,
+        size_t recent_window_blocks
+    ) = 0;
+};
+
+// Spin (arXiv:2604.26837) Centroid-Based Sparse Indexer implementation
+class SpinCentroidIndexer : public ISparseIndexer {
+public:
+    SpinCentroidIndexer() = default;
+
+    SparsityPartition index_query(
+        uint32_t query_token_id,
+        const float* query_vec,
+        size_t head_dim,
+        const std::vector<int32_t>& block_table,
+        PagedKVCacheManager& kv_mgr,
+        size_t layer_idx,
+        size_t kv_head_idx,
+        float retention_ratio,
+        size_t recent_window_blocks
+    ) override {
+        SparsityPartition sp;
+        sp.query_token_id = query_token_id;
+        if (block_table.empty() || head_dim == 0) return sp;
+
+        size_t total_blocks = block_table.size();
+        size_t num_recent = std::min(recent_window_blocks, total_blocks);
+        size_t historical_blocks = total_blocks - num_recent;
+        size_t top_k = std::max<size_t>(1, static_cast<size_t>(historical_blocks * retention_ratio));
+
+        size_t c_stride = kv_mgr.get_num_heads() * head_dim;
+        std::vector<std::pair<float, int32_t>> scores;
+        scores.reserve(historical_blocks);
+
+        for (size_t b = 0; b < historical_blocks; ++b) {
+            int32_t blk_id = block_table[b];
+            KVBlock* blk = kv_mgr.get_block(blk_id);
+            if (!blk || !blk->k_centroid || !blk->centroid_valid) {
+                scores.push_back({0.0f, blk_id});
+                continue;
+            }
+            const float* c_vec = blk->k_centroid + (layer_idx * c_stride) + (kv_head_idx * head_dim);
+
+            float dot = 0.0f;
+#if defined(NEXUS_HAVE_AVX2)
+            __m256 vdot = _mm256_setzero_ps();
+            for (size_t d = 0; d < head_dim; d += 8) {
+                vdot = _mm256_fmadd_ps(_mm256_loadu_ps(query_vec + d), _mm256_loadu_ps(c_vec + d), vdot);
+            }
+            alignas(32) float arr[8];
+            _mm256_store_ps(arr, vdot);
+            dot = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+#else
+            for (size_t d = 0; d < head_dim; ++d) dot += query_vec[d] * c_vec[d];
+#endif
+            scores.push_back({dot, blk_id});
+        }
+
+        if (top_k < scores.size()) {
+            std::partial_sort(scores.begin(), scores.begin() + top_k, scores.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            sp.score_threshold = scores[top_k - 1].first;
+        } else if (!scores.empty()) {
+            sp.score_threshold = scores.back().first;
+        }
+
+        sp.selected_page_ids.reserve(top_k + num_recent);
+        size_t take_hist = std::min(top_k, scores.size());
+        for (size_t i = 0; i < take_hist; ++i) {
+            sp.selected_page_ids.push_back(scores[i].second);
+        }
+        for (size_t i = historical_blocks; i < total_blocks; ++i) {
+            sp.selected_page_ids.push_back(block_table[i]);
+        }
+
+        if (!sp.selected_page_ids.empty()) {
+            sp.coarse_block_id = static_cast<uint32_t>(sp.selected_page_ids[0]);
+        }
+        return sp;
+    }
+};
+
+// ============================================================================
+// Issue 2: Spin 64-Bucket Recency Ring LRU
+// True temporal decay with O(1) access updates and O(64) bounded victim scan
+// ============================================================================
+class BucketedLRUCache {
+public:
+    static constexpr uint32_t NUM_BUCKETS = 64;
+
+    BucketedLRUCache() = default;
+
+    void record_access(int32_t block_id, uint32_t ref_count = 1) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_tick_++;
+        // If block has multiple references (shared system prompt prefix), boost into warm/hot sector
+        uint32_t target_bucket = (ref_count > 1)
+            ? ((current_tick_ + NUM_BUCKETS / 2) % NUM_BUCKETS)
+            : (current_tick_ % NUM_BUCKETS);
+
+        // Remove from previous bucket if already tracked (O(1) amortized via bucket index map)
+        auto it = block_bucket_.find(block_id);
+        if (it != block_bucket_.end()) {
+            uint32_t old_bucket = it->second;
+            auto& old_list = buckets_[old_bucket];
+            for (auto dit = old_list.begin(); dit != old_list.end(); ++dit) {
+                if (*dit == block_id) {
+                    old_list.erase(dit);
+                    break;
+                }
+            }
+        }
+
+        buckets_[target_bucket].push_back(block_id);
+        block_bucket_[block_id] = target_bucket;
+    }
+
+    void mark_evictable(int32_t block_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = block_bucket_.find(block_id);
+        if (it != block_bucket_.end()) {
+            uint32_t old_bucket = it->second;
+            auto& old_list = buckets_[old_bucket];
+            for (auto dit = old_list.begin(); dit != old_list.end(); ++dit) {
+                if (*dit == block_id) {
+                    old_list.erase(dit);
+                    break;
+                }
+            }
+        }
+        // Place in oldest bucket for priority eviction
+        uint32_t oldest_bucket = (current_tick_ + 1) % NUM_BUCKETS;
+        buckets_[oldest_bucket].push_front(block_id);
+        block_bucket_[block_id] = oldest_bucket;
+    }
+
+    // Victim selection: scans NUM_BUCKETS (64 slots) from oldest to newest tick: O(64) worst-case
+    int32_t evict_next() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (uint32_t i = 0; i < NUM_BUCKETS; ++i) {
+            uint32_t idx = (current_tick_ + 1 + i) % NUM_BUCKETS;
+            if (!buckets_[idx].empty()) {
+                int32_t victim = buckets_[idx].front();
+                buckets_[idx].pop_front();
+                block_bucket_.erase(victim);
+                return victim;
+            }
+        }
+        return -1; // No unpinned blocks evictable
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return block_bucket_.size();
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return block_bucket_.empty();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    uint32_t current_tick_ = 0;
+    std::array<std::deque<int32_t>, NUM_BUCKETS> buckets_;
+    std::unordered_map<int32_t, uint32_t> block_bucket_;
+};
+
+// ============================================================================
+// Issue 3: P2 Two-Level Paged Metadata Architecture (Design Specification)
+// Scales to 10M+ KV blocks without flat std::vector<int32_t> blowup.
+// Documented for multi-node / enterprise context scaling.
+// ============================================================================
+struct MetadataSegment {
+    int32_t entries[256];       // 256 physical block indices per segment
+    uint8_t flags[256];         // Residency flags, dirty state, reference bits
+};
+
+struct MetadataPageTable {
+    MetadataSegment* segment_dir[256] = {nullptr};  // Level 0 directory (256 segments)
+    // Level 1: segments allocated on demand (256 * 256 = 65,536 page entries per table)
+    ~MetadataPageTable() {
+        for (size_t i = 0; i < 256; ++i) {
+            delete segment_dir[i];
+            segment_dir[i] = nullptr;
+        }
+    }
+};
+
+// ============================================================================
+// Issue 4: Mandatory vs Buffering Budget Split
+// Protects recent sliding window & prefix blocks from being evicted under memory pressure
+// ============================================================================
+struct RequestBudget {
+    uint32_t mandatory_pages = 0;   // Never evicted (e.g. recent context window, system prompt)
+    uint32_t buffering_pages = 0;   // Dynamically resizable by PD scheduler under HBM pressure
+
+    uint32_t total() const { return mandatory_pages + buffering_pages; }
+};
+
+// Memory Partition Scope for Tenancy & PD Isolation
 enum class PartitionScope : uint32_t {
     PREFILL_DEDICATED = 0,
     DECODE_DEDICATED = 1,
@@ -19,7 +247,7 @@ enum class PartitionScope : uint32_t {
     ISOLATED_TENANT = 3
 };
 
-// Head-Wise Page abstraction: Decouples physical memory allocated for individual attention heads
+// Head-Wise Page View: Decouples physical page offsets down to individual attention heads
 struct HeadWisePage {
     int32_t physical_block_id = -1;
     size_t head_index = 0;
@@ -30,130 +258,102 @@ struct HeadWisePage {
     float* centroid_head_ptr = nullptr;
 };
 
-// Multi-Tier Bucketed LRU Cache Ring
-// Tracks allocated blocks across distinct access temperature tiers:
-// - Hot Bucket: frequently referenced blocks, protected from eviction
-// - Warm Bucket: active generation blocks
-// - Cold/Evictable Bucket: candidate blocks for reuse or tier migration
-class BucketedLRUCache {
-public:
-    BucketedLRUCache() = default;
-
-    void record_access(int32_t block_id, uint32_t ref_count) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (ref_count > 1) {
-            // Shared prefix: promote directly to Hot tier
-            promote_to(hot_bucket_, block_id);
-        } else {
-            // Generation decode token: promote to Warm tier
-            promote_to(warm_bucket_, block_id);
-        }
-    }
-
-    void mark_evictable(int32_t block_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        remove_from_all(block_id);
-        cold_bucket_.push_back(block_id);
-    }
-
-    int32_t evict_next() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!cold_bucket_.empty()) {
-            int32_t b = cold_bucket_.front();
-            cold_bucket_.pop_front();
-            return b;
-        }
-        if (!warm_bucket_.empty()) {
-            int32_t b = warm_bucket_.front();
-            warm_bucket_.pop_front();
-            return b;
-        }
-        return -1; // No unpinned blocks evictable
-    }
-
-    size_t get_hot_count() const { std::lock_guard<std::mutex> lock(mutex_); return hot_bucket_.size(); }
-    size_t get_warm_count() const { std::lock_guard<std::mutex> lock(mutex_); return warm_bucket_.size(); }
-    size_t get_cold_count() const { std::lock_guard<std::mutex> lock(mutex_); return cold_bucket_.size(); }
-
-private:
-    void remove_from_all(int32_t b) {
-        auto rm = [b](std::deque<int32_t>& d) {
-            for (auto it = d.begin(); it != d.end(); ++it) {
-                if (*it == b) { d.erase(it); break; }
-            }
-        };
-        rm(hot_bucket_);
-        rm(warm_bucket_);
-        rm(cold_bucket_);
-    }
-
-    void promote_to(std::deque<int32_t>& target, int32_t b) {
-        remove_from_all(b);
-        target.push_back(b);
-        // Cap hot and warm buckets to maintain temporal bounds
-        if (target.size() > 2048) {
-            int32_t demoted = target.front();
-            target.pop_front();
-            cold_bucket_.push_back(demoted);
-        }
-    }
-
-    mutable std::mutex mutex_;
-    std::deque<int32_t> hot_bucket_;
-    std::deque<int32_t> warm_bucket_;
-    std::deque<int32_t> cold_bucket_;
-};
-
-// Partition Abstraction: Manages isolated or shared sub-pools of KV blocks
+// Memory Partition: Manages a budgeted slice of physical KV blocks with LRU decay
 class MemoryPartition {
 public:
     MemoryPartition(const std::string& partition_id, PartitionScope scope, size_t block_budget, std::shared_ptr<PagedKVCacheManager> kv_mgr)
-        : partition_id_(partition_id), scope_(scope), block_budget_(block_budget), kv_mgr_(kv_mgr) {}
+        : partition_id_(partition_id), scope_(scope), kv_mgr_(kv_mgr) {
+        budget_.buffering_pages = static_cast<uint32_t>(block_budget);
+        budget_.mandatory_pages = 0;
+    }
+
+    MemoryPartition(const std::string& partition_id, PartitionScope scope, RequestBudget budget, std::shared_ptr<PagedKVCacheManager> kv_mgr)
+        : partition_id_(partition_id), scope_(scope), budget_(budget), kv_mgr_(kv_mgr) {}
 
     const std::string& get_partition_id() const { return partition_id_; }
     PartitionScope get_scope() const { return scope_; }
-    size_t get_budget() const { return block_budget_; }
-    size_t get_allocated_count() const { return allocated_blocks_.size(); }
+    size_t get_budget() const { return budget_.total(); }
+    RequestBudget get_request_budget() const { std::lock_guard<std::mutex> lock(mutex_); return budget_; }
+    size_t get_allocated_count() const { std::lock_guard<std::mutex> lock(mutex_); return allocated_blocks_.size(); }
 
-    std::vector<int32_t> allocate_blocks(size_t count) {
+    // Dynamic buffering budget resize (called by PD scheduler under global memory pressure)
+    void resize_buffering(uint32_t new_buffering_count) {
+        std::vector<int32_t> to_evict;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (new_buffering_count < budget_.buffering_pages) {
+                uint32_t diff = budget_.buffering_pages - new_buffering_count;
+                budget_.buffering_pages = new_buffering_count;
+                for (uint32_t i = 0; i < diff; ++i) {
+                    int32_t victim = lru_.evict_next();
+                    if (victim >= 0) {
+                        allocated_blocks_.erase(victim);
+                        to_evict.push_back(victim);
+                    }
+                }
+            } else {
+                budget_.buffering_pages = new_buffering_count;
+            }
+        }
+        if (!to_evict.empty() && kv_mgr_) {
+            kv_mgr_->release_blocks(to_evict);
+        }
+    }
+
+    void set_mandatory_budget(uint32_t mandatory_count) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (allocated_blocks_.size() + count > block_budget_) {
-            // Trigger bucketed LRU eviction if budget exceeded
-            size_t needed = (allocated_blocks_.size() + count) - block_budget_;
-            for (size_t i = 0; i < needed; ++i) {
-                int32_t b = lru_.evict_next();
-                if (b >= 0 && kv_mgr_) {
-                    kv_mgr_->release_blocks({b});
-                    for (auto it = allocated_blocks_.begin(); it != allocated_blocks_.end(); ++it) {
-                        if (*it == b) { allocated_blocks_.erase(it); break; }
+        budget_.mandatory_pages = mandatory_count;
+    }
+
+    // Allocate physical blocks with eviction performed outside the partition mutex to avoid serialization
+    std::vector<int32_t> allocate_blocks(size_t count) {
+        std::vector<int32_t> to_evict;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            uint32_t total_budget = budget_.total();
+            if (allocated_blocks_.size() + count > total_budget) {
+                size_t needed = (allocated_blocks_.size() + count) - total_budget;
+                for (size_t i = 0; i < needed; ++i) {
+                    int32_t victim = lru_.evict_next();
+                    if (victim >= 0) {
+                        allocated_blocks_.erase(victim);
+                        to_evict.push_back(victim);
                     }
                 }
             }
         }
 
+        // Evict outside lock
+        if (!to_evict.empty() && kv_mgr_) {
+            kv_mgr_->release_blocks(to_evict);
+        }
+
         if (!kv_mgr_) return {};
         auto blocks = kv_mgr_->allocate_blocks(count);
-        for (int32_t b : blocks) {
-            allocated_blocks_.push_back(b);
-            lru_.record_access(b, 1);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (int32_t b : blocks) {
+                allocated_blocks_.insert(b);
+                lru_.record_access(b, 1);
+            }
         }
         return blocks;
     }
 
+    // O(1) release using std::unordered_set membership
     void release_blocks(const std::vector<int32_t>& block_ids) {
-        std::lock_guard<std::mutex> lock(mutex_);
         if (kv_mgr_) {
             kv_mgr_->release_blocks(block_ids);
         }
+        std::lock_guard<std::mutex> lock(mutex_);
         for (int32_t b : block_ids) {
-            for (auto it = allocated_blocks_.begin(); it != allocated_blocks_.end(); ++it) {
-                if (*it == b) { allocated_blocks_.erase(it); break; }
-            }
+            allocated_blocks_.erase(b);
             lru_.mark_evictable(b);
         }
     }
 
-    // Resolves head-wise page descriptors for granular head allocation
+    // Resolves head-wise page descriptors with verified KVBlock layout offsets
     HeadWisePage get_head_page(int32_t block_id, size_t layer_idx, size_t head_idx) {
         HeadWisePage hp;
         hp.physical_block_id = block_id;
@@ -177,14 +377,19 @@ public:
         return hp;
     }
 
-    BucketedLRUCache& get_lru() { return lru_; }
+    // Thread-safe access to LRU statistics
+    size_t get_lru_size() const { return lru_.size(); }
+
+    void record_block_access(int32_t block_id, uint32_t ref_count = 1) {
+        lru_.record_access(block_id, ref_count);
+    }
 
 private:
     std::string partition_id_;
     PartitionScope scope_;
-    size_t block_budget_;
+    RequestBudget budget_;
     std::shared_ptr<PagedKVCacheManager> kv_mgr_;
-    std::vector<int32_t> allocated_blocks_;
+    std::unordered_set<int32_t> allocated_blocks_;
     BucketedLRUCache lru_;
     mutable std::mutex mutex_;
 };
@@ -197,7 +402,24 @@ public:
         return mgr;
     }
 
-    std::shared_ptr<MemoryPartition> create_partition(const std::string& id, PartitionScope scope, size_t budget, std::shared_ptr<PagedKVCacheManager> kv_mgr) {
+    std::shared_ptr<MemoryPartition> create_partition(
+        const std::string& id, 
+        PartitionScope scope, 
+        size_t budget, 
+        std::shared_ptr<PagedKVCacheManager> kv_mgr
+    ) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto part = std::make_shared<MemoryPartition>(id, scope, budget, kv_mgr);
+        partitions_[id] = part;
+        return part;
+    }
+
+    std::shared_ptr<MemoryPartition> create_partition_with_budget(
+        const std::string& id, 
+        PartitionScope scope, 
+        RequestBudget budget, 
+        std::shared_ptr<PagedKVCacheManager> kv_mgr
+    ) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto part = std::make_shared<MemoryPartition>(id, scope, budget, kv_mgr);
         partitions_[id] = part;

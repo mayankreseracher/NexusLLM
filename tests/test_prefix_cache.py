@@ -58,5 +58,20 @@ class TestPrefixCache(unittest.TestCase):
         res = lib.nexus_verify_partition_and_bucketed_lru()
         self.assertEqual(res, 0, f"nexus_verify_partition_and_bucketed_lru failed with code {res}")
 
+    def test_python_bindings_partition_and_spin_sparse_verification(self):
+        try:
+            from nexus_llm.bindings import NexusNativeEngine
+        except ImportError:
+            from nexus_engine.python.nexus_llm.bindings import NexusNativeEngine
+
+        engine = NexusNativeEngine()
+        part_res = engine.verify_partition_and_bucketed_lru()
+        self.assertEqual(part_res, 0, f"Engine partition verification failed: {part_res}")
+
+        spin_diff = engine.verify_spin_sparse_attention()
+        self.assertGreaterEqual(spin_diff, 0.0)
+        self.assertLess(spin_diff, 0.50, f"Spin sparse attention diff exceeded threshold: {spin_diff}")
+        engine.close()
+
 if __name__ == "__main__":
     unittest.main()

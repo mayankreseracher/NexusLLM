@@ -13,9 +13,9 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 | **Dynamic Memory Tiering** | **Operational** | Pinned Host RAM (`VirtualAlloc` on Win, `mmap`/THP on Linux, UMA zero-copy on macOS Apple Silicon). |
 | **Double-Buffered Overlap (Phase 4)**| **Operational** | Ping-pong layer slots with asynchronous background worker prefetching layer $l+1$ while layer $l$ computes. |
 | **Paged KV Cache Management** | **Operational** | Block allocator with on-demand allocation, reference counting, and Radix tree prefix caching. |
-| **Memory Partition & Bucketed LRU** | **Operational** | Multi-tenant memory partitions (`MemoryPartition`, `PartitionManager`) with 3-tier Hot/Warm/Cold bucketed LRU ring buffers. |
+| **Memory Partition & Bucketed LRU** | **Operational** | Multi-tenant memory partitions with `RequestBudget` (mandatory/buffering split) and 64-bucket recency decay ring LRU (`NUM_BUCKETS = 64`). |
 | **Head-Wise Paging** | **Operational** | Decoupled per-head page views (`HeadWisePage`) eliminating fragmentation across GQA ratios. |
-| **Sparse Attention Indexing (Spin)**| **Operational** | Dynamic coarse Key centroid evaluation (arXiv:2604.26837) pruning 60% of cold blocks ahead of token attention. |
+| **Sparse Attention Indexing (Spin)**| **Operational** | Dynamic coarse Key centroid evaluation (arXiv:2604.26837) with `SparsityPartition` & `SpinCentroidIndexer`, pruning 60% of cold blocks ahead of token attention. |
 | **Transformer Forward Pass** | **Operational** | Complete mathematical execution: Token Embedding -> RMSNorm -> QKV GEMV -> RoPE -> PagedAttention Dot-Product & Softmax -> Wo -> RMSNorm -> SwiGLU FFN -> LM Head Logits -> Sampling. |
 | **Continuous Batching Scheduler**| **Operational** | Chunked prefill scheduling and iteration-level decode loop in C ABI and Python runtime. |
 | **Quantization & SIMD Kernels** | **Operational** | Fused quantized GEMV for GGUF Q4_0, Q8_0, Q5_K, Q6_K, FP16 via AVX2+FMA (x86_64) and ARM NEON (ARM64). |
@@ -105,6 +105,19 @@ NexusLLM features a modular hardware device abstraction (`INexusComputeBackend` 
 - **Intel Arc oneAPI / SYCL**: Probes Intel Level Zero (`ze_loader.dll` / `libze_loader.so`), Intel Graphics Compute runtime via OpenCL ICD (for Intel Arc A-Series, Battlemage, and Iris Xe), or activates the Intel oneAPI DPC++ / SYCL USM emulation bridge.
 - **Universal OpenCL**: Universal cross-vendor GPU accelerator backend dynamically binding to OpenCL 3.0 (`OpenCL.dll` / `libOpenCL.so.1` / `OpenCL.framework`), providing immediate hardware GPU acceleration on any system without proprietary SDK installations.
 - **CPU SIMD Reference Engine**: Highly optimized AVX2+FMA (x86_64) and ARM NEON (AArch64) fused quantized GEMV and PagedAttention kernels.
+
+### 7. Spin Sparse Attention & Memory Partition Architecture
+- **Spin Sparse Paged Attention ([arXiv:2604.26837](https://arxiv.org/abs/2604.26837))**:
+  - **Coarse Key Centroid Pruning**: Tracks mean Key centroids per block, layer, and KV head (`k_centroid`). During decode, evaluates inner product between Query $Q$ and block centroids, retaining the top-40% historical blocks plus the immediate local window. Prunes 60% of cold blocks with $< 3.1\%$ memory overhead and zero retraining.
+  - **Sparsity Partition & Indexer (`SparsityPartition`, `ISparseIndexer`, `SpinCentroidIndexer`)**: Maps coarse-grained sparse block selection into physical page IDs for each query token with adaptive score thresholds.
+- **64-Bucket Recency Ring LRU (`BucketedLRUCache`)**:
+  - Implements bounded $N=64$ temporal slot decay ring (`current_tick_ % 64`).
+  - $O(1)$ amortized access updates via bucket index map; bounded $O(64)$ worst-case victim selection scanning from oldest to newest tick.
+- **Dynamic Request Budgeting (`RequestBudget`)**:
+  - Enforces strict separation between **mandatory pages** (un-evictable anchor/window tokens) and **buffering pages** (reclaimable under memory pressure).
+  - PD scheduler dynamically shrinks or expands buffering pages via `resize_buffering()` based on global HBM/VRAM contention.
+- **Two-Level Paged Metadata Specification (`MetadataSegment`, `MetadataPageTable`)**:
+  - Prepares architecture for scaling to millions of concurrent KV blocks without flat vector memory blowup, organizing page table entries into 256-entry segments.
 
 ---
 

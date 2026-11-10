@@ -1,4 +1,5 @@
 # Binaries & Compiled Artifacts
+nexus_bench
 *.dll
 *.exe
 *.so

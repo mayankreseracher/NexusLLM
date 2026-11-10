@@ -217,6 +217,24 @@ class NexusNativeEngine:
         self._lib.nexus_get_platform_info.argtypes = [ctypes.POINTER(NexusPlatformInfoStruct)]
         self._lib.nexus_get_platform_info.restype = None
 
+        if hasattr(self._lib, 'nexus_verify_partition_and_bucketed_lru'):
+            self._lib.nexus_verify_partition_and_bucketed_lru.argtypes = []
+            self._lib.nexus_verify_partition_and_bucketed_lru.restype = ctypes.c_int32
+
+        if hasattr(self._lib, 'nexus_verify_spin_sparse_attention'):
+            self._lib.nexus_verify_spin_sparse_attention.argtypes = []
+            self._lib.nexus_verify_spin_sparse_attention.restype = ctypes.c_float
+
+    def verify_partition_and_bucketed_lru(self) -> int:
+        if self._lib and hasattr(self._lib, 'nexus_verify_partition_and_bucketed_lru'):
+            return int(self._lib.nexus_verify_partition_and_bucketed_lru())
+        return -999
+
+    def verify_spin_sparse_attention(self) -> float:
+        if self._lib and hasattr(self._lib, 'nexus_verify_spin_sparse_attention'):
+            return float(self._lib.nexus_verify_spin_sparse_attention())
+        return -999.0
+
     def get_platform_capabilities(self) -> NexusPlatformCapabilities:
         """Returns detected raw hardware performance capabilities across macOS, Linux, and Windows."""
         if self._lib:

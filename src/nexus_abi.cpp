@@ -407,7 +407,6 @@ NEXUS_API float nexus_verify_spin_sparse_attention(void) {
         size_t blk_idx = pos / nexus::BLOCK_SIZE;
         size_t slot = pos % nexus::BLOCK_SIZE;
         auto* blk = kv_mgr.get_block(block_table[blk_idx]);
-        size_t stride = num_kv_heads * nexus::BLOCK_SIZE * head_dim;
         for (size_t h = 0; h < num_kv_heads; ++h) {
             float* k_ptr = blk->key_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
             float* v_ptr = blk->value_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
@@ -480,26 +479,59 @@ NEXUS_API void nexus_fused_gemv_fp8(const uint8_t* W_fp8,
     nexus::QuantizationKernel::fused_gemv_fp8(W_fp8, x, y, rows, cols, scale);
 }
 
-// Memory Partition & Bucketed LRU Verification ABI
+// Memory Partition, Bucketed LRU & Spin Sparsity Partition Verification ABI
 NEXUS_API int32_t nexus_verify_partition_and_bucketed_lru(void) {
     auto kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(64, 2, 4, 64);
-    auto part = nexus::PartitionManager::instance().create_partition("tenant_test", nexus::PartitionScope::ISOLATED_TENANT, 16, kv_mgr);
+    
+    // Test 1: Partition creation with RequestBudget (mandatory + buffering split)
+    nexus::RequestBudget budget{4, 12}; // 4 mandatory, 12 buffering = 16 total
+    auto part = nexus::PartitionManager::instance().create_partition_with_budget(
+        "tenant_test", nexus::PartitionScope::ISOLATED_TENANT, budget, kv_mgr
+    );
     if (!part) return -1;
+    if (part->get_budget() != 16) return -2;
 
-    // Allocate 10 blocks (under budget)
+    // Allocate 10 blocks (under budget of 16)
     auto b1 = part->allocate_blocks(10);
-    if (b1.size() != 10) return -2;
+    if (b1.size() != 10 || part->get_allocated_count() != 10) return -3;
 
-    // Allocate 10 more blocks (exceeding budget of 16, triggers bucketed LRU eviction)
+    // Allocate 10 more blocks (total requested 20 > budget 16, triggers bucketed LRU eviction of 4 blocks)
     auto b2 = part->allocate_blocks(10);
-    if (b2.size() != 10) return -3;
+    if (b2.size() != 10 || part->get_allocated_count() != 16) return -4;
 
-    // Test head-wise page descriptor extraction
+    // Test 2: Dynamic buffering resize (Issue 4)
+    // Shrink buffering pages from 12 to 6 (total budget 4 + 6 = 10 blocks)
+    part->resize_buffering(6);
+    if (part->get_allocated_count() != 10) return -5;
+
+    // Test 3: Head-wise page descriptor extraction
     auto hp = part->get_head_page(b2[0], 0, 1);
-    if (hp.head_index != 1 || hp.layer_index != 0) return -4;
+    if (hp.head_index != 1 || hp.layer_index != 0) return -6;
+
+    // Test 4: Spin Centroid Indexer & SparsityPartition (Issue 1)
+    for (int32_t blk_id : b2) {
+        nexus::KVBlock* blk = kv_mgr->get_block(blk_id);
+        if (blk) {
+            blk->tokens_occupied = 16;
+            blk->update_centroid(0, 4, 64);
+        }
+    }
+
+    nexus::SpinCentroidIndexer indexer;
+    std::vector<float> query_vec(64, 1.0f);
+    auto sp = indexer.index_query(
+        42, query_vec.data(), 64, b2, *kv_mgr, 0, 0, 0.5f, 2
+    );
+
+    if (sp.query_token_id != 42) return -7;
+    if (sp.selected_page_ids.empty()) return -8;
+
+    // Test 5: O(1) release via unordered_set
+    part->release_blocks({b2[0]});
+    if (part->get_allocated_count() != 9) return -9;
 
     nexus::PartitionManager::instance().remove_partition("tenant_test");
-    return 0; // Success
+    return 0; // All checks passed
 }
 
 } // extern "C"
