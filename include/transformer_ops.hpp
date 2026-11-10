@@ -105,23 +105,58 @@ public:
     // Matrix-Vector Multiplication: y = W * x
     // W is [rows, cols] row-major, x is [cols], y is [rows]
     static void matmul_vec(const float* W, const float* x, float* y, size_t rows, size_t cols) {
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
         for (size_t r = 0; r < rows; ++r) {
             float sum = 0.0f;
             const float* row = W + (r * cols);
+#if defined(NEXUS_HAVE_AVX2)
+            __m256 v_acc = _mm256_setzero_ps();
+            size_t c = 0;
+            for (; c + 8 <= cols; c += 8) {
+                __m256 vw = _mm256_loadu_ps(row + c);
+                __m256 vx = _mm256_loadu_ps(x + c);
+                v_acc = _mm256_fmadd_ps(vw, vx, v_acc);
+            }
+            alignas(32) float arr[8];
+            _mm256_store_ps(arr, v_acc);
+            sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+            for (; c < cols; ++c) {
+                sum += row[c] * x[c];
+            }
+#elif defined(NEXUS_HAVE_ARM_NEON)
+            float32x4_t v_acc = vdupq_n_f32(0.0f);
+            size_t c = 0;
+            for (; c + 4 <= cols; c += 4) {
+                float32x4_t vw = vld1q_f32(row + c);
+                float32x4_t vx = vld1q_f32(x + c);
+                v_acc = vfmaq_f32(v_acc, vw, vx);
+            }
+            sum = vaddvq_f32(v_acc);
+            for (; c < cols; ++c) {
+                sum += row[c] * x[c];
+            }
+#else
             for (size_t c = 0; c < cols; ++c) {
                 sum += row[c] * x[c];
             }
+#endif
             y[r] = sum;
         }
     }
 
-    // Matrix-Vector Multiplication supporting FP32, FP16, GGUF Q4_0, and GGUF Q8_0
+    // Matrix-Vector Multiplication supporting FP32, FP16, GGUF Q4_0, Q8_0, Q5_K, and Q6_K
     static void matmul_vec_dispatch(const void* W, DataType dtype, const float* x, float* y, size_t rows, size_t cols) {
         if (!W) return;
         if (dtype == DataType::GGUF_Q4_0) {
             QuantizationKernel::fused_gemv_q4_0(static_cast<const BlockQ4_0*>(W), x, y, rows, cols);
         } else if (dtype == DataType::GGUF_Q8_0) {
             QuantizationKernel::fused_gemv_q8_0(static_cast<const BlockQ8_0*>(W), x, y, rows, cols);
+        } else if (dtype == DataType::GGUF_Q5_K) {
+            QuantizationKernel::fused_gemv_q5_k(static_cast<const BlockQ5_K*>(W), x, y, rows, cols);
+        } else if (dtype == DataType::GGUF_Q6_K) {
+            QuantizationKernel::fused_gemv_q6_k(static_cast<const BlockQ6_K*>(W), x, y, rows, cols);
         } else if (dtype == DataType::FP16) {
             QuantizationKernel::fused_gemv_fp16(static_cast<const uint16_t*>(W), x, y, rows, cols);
         } else {
@@ -149,6 +184,9 @@ public:
         float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         size_t total_tokens = seq_len + 1;
 
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
         for (size_t h = 0; h < num_heads; ++h) {
             size_t kv_h = h / kv_mul;
             const float* q_h = Q + (h * head_dim);

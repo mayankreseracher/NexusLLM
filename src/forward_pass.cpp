@@ -182,6 +182,9 @@ void ForwardPassExecutor::paged_attention_cpu(
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
     size_t total_tokens = seq_len + 1;
 
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(static)
+#endif
     for (size_t h = 0; h < num_heads_; ++h) {
         size_t kv_h = h / kv_mul;
         const float* q_h = Q + (h * head_dim_);
@@ -379,6 +382,14 @@ int32_t ForwardPassExecutor::forward_token(
                     act_hidden_[b * 32 + j] = blocks[b].qs[j] * d;
                 }
             }
+        } else if (dt_emb == DataType::GGUF_Q5_K) {
+            size_t blocks_per_row = hidden_size_ / QK_K;
+            const BlockQ5_K* blocks = static_cast<const BlockQ5_K*>(emb_raw) + (safe_tok * blocks_per_row);
+            QuantizationKernel::dequantize_gguf_q5_k(blocks, act_hidden_.data(), blocks_per_row);
+        } else if (dt_emb == DataType::GGUF_Q6_K) {
+            size_t blocks_per_row = hidden_size_ / QK_K;
+            const BlockQ6_K* blocks = static_cast<const BlockQ6_K*>(emb_raw) + (safe_tok * blocks_per_row);
+            QuantizationKernel::dequantize_gguf_q6_k(blocks, act_hidden_.data(), blocks_per_row);
         } else {
             const float* emb_row = static_cast<const float*>(emb_raw) + (safe_tok * hidden_size_);
             std::memcpy(act_hidden_.data(), emb_row, hidden_size_ * sizeof(float));

@@ -89,7 +89,12 @@ def find_nexus_library(dll_path: Optional[str] = None) -> str:
     repo_dir = pkg_dir.parent.parent
     cwd = Path.cwd()
 
-    names = ["nexus_engine.dll", "libnexus_engine.so", "libnexus_engine.dylib"]
+    if sys.platform == "win32":
+        names = ["nexus_engine.dll"]
+    elif sys.platform == "darwin":
+        names = ["libnexus_engine.dylib", "libnexus_engine.so"]
+    else:
+        names = ["libnexus_engine.so"]
     search_dirs = [
         repo_dir,
         repo_dir / "build",

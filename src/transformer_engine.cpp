@@ -232,6 +232,14 @@ int32_t TransformerEngine::forward_token(
                     act_x_[b * 32 + j] = blocks[b].qs[j] * d;
                 }
             }
+        } else if (dt_emb == DataType::GGUF_Q5_K) {
+            size_t blocks_per_row = hidden_size_ / QK_K;
+            const BlockQ5_K* blocks = static_cast<const BlockQ5_K*>(emb_raw) + (safe_tok * blocks_per_row);
+            QuantizationKernel::dequantize_gguf_q5_k(blocks, act_x_.data(), blocks_per_row);
+        } else if (dt_emb == DataType::GGUF_Q6_K) {
+            size_t blocks_per_row = hidden_size_ / QK_K;
+            const BlockQ6_K* blocks = static_cast<const BlockQ6_K*>(emb_raw) + (safe_tok * blocks_per_row);
+            QuantizationKernel::dequantize_gguf_q6_k(blocks, act_x_.data(), blocks_per_row);
         } else {
             const float* emb_row = static_cast<const float*>(emb_raw) + (safe_tok * hidden_size_);
             std::memcpy(act_x_.data(), emb_row, hidden_size_ * sizeof(float));
@@ -521,6 +529,8 @@ std::vector<int32_t> TransformerEngine::predict_mtp_draft(
     int32_t current_token,
     size_t current_pos,
     size_t num_draft_tokens) {
+    (void)current_token;
+    (void)current_pos;
 
     std::vector<int32_t> drafts;
     if (num_draft_tokens == 0) return drafts;
@@ -566,6 +576,7 @@ std::vector<int32_t> TransformerEngine::predict_mtp_draft(
             int32_t pred = TransformerOps::sample_logits(mtp_logits.data(), vocab_size_, 0.0f);
             drafts.push_back(pred);
             prev_tok = pred;
+            (void)prev_tok;
         } else {
             // No MTP/Medusa auxiliary head registered for position k; stop drafting without hallucinating fake tokens
             break;

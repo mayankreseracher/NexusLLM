@@ -22,6 +22,30 @@ struct BlockINT8 {
     int8_t qs[32];
 };
 
+// 256 values per block for k-quants
+constexpr size_t QK_K = 256;
+
+// Quantization block for GGUF Q5_K: 256 values per block
+// 2-byte scale delta (FP16), 2-byte min delta (FP16), 12-byte sub-block scales/mins, 32-byte high bits (qh), 128-byte low nibbles (qs)
+// Total size: 176 bytes
+struct BlockQ5_K {
+    uint16_t d;           // super-block scale (fp16)
+    uint16_t dmin;        // super-block min (fp16)
+    uint8_t scales[12];   // 16 6-bit scales and 16 6-bit mins packed into 12 bytes
+    uint8_t qh[32];       // 256 1-bit high quant values
+    uint8_t qs[QK_K / 2]; // 256 4-bit low quant values (128 bytes)
+};
+
+// Quantization block for GGUF Q6_K: 256 values per block
+// 128-byte low 4 bits (ql), 64-byte high 2 bits (qh), 16-byte signed scales (scales), 2-byte scale delta (d)
+// Total size: 210 bytes
+struct BlockQ6_K {
+    uint8_t ql[QK_K / 2];   // 256 4-bit low quant values
+    uint8_t qh[QK_K / 4];   // 256 2-bit high quant values
+    int8_t scales[QK_K / 16];// 16 8-bit sub-block scales
+    uint16_t d;             // super-block scale (fp16)
+};
+
 // AWQ / GPTQ packed group
 struct BlockAWQ_G128 {
     float scale;
@@ -102,6 +126,27 @@ public:
                                 size_t cols);
 
     static void fused_gemv_fp16(const uint16_t* W_fp16,
+                                const float* x,
+                                float* y,
+                                size_t rows,
+                                size_t cols);
+
+    // GGUF Q5_K and Q6_K Fused GEMV and Dequantization kernels
+    static void dequantize_gguf_q5_k(const BlockQ5_K* blocks,
+                                     float* output,
+                                     size_t num_blocks);
+
+    static void dequantize_gguf_q6_k(const BlockQ6_K* blocks,
+                                     float* output,
+                                     size_t num_blocks);
+
+    static void fused_gemv_q5_k(const BlockQ5_K* W_q5_k,
+                                const float* x,
+                                float* y,
+                                size_t rows,
+                                size_t cols);
+
+    static void fused_gemv_q6_k(const BlockQ6_K* W_q6_k,
                                 const float* x,
                                 float* y,
                                 size_t rows,

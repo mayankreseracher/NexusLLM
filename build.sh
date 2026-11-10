@@ -71,7 +71,7 @@ fi
 echo -e "${CYAN}[Compiler]${NC} Using: ${BOLD}${CXX}${NC}"
 
 # Determine compiler & linker flags based on platform and raw performance capabilities
-CXXFLAGS="-O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -pthread"
+CXXFLAGS="-O3 -Wall -Wextra -std=c++20 -Iinclude -fPIC -pthread -fopenmp"
 
 if [ "$OS" = "Darwin" ]; then
     SHARED_OUT="libnexus_engine.dylib"

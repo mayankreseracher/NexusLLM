@@ -204,6 +204,7 @@ NEXUS_API int32_t nexus_step_continuous_batch(NexusEngineHandle engine,
                                              char** out_finished_ids, 
                                              int32_t* out_tokens, 
                                              size_t max_out) {
+    (void)out_finished_ids;
     if (!engine) return 0;
     auto* eng = static_cast<InternalEngine*>(engine);
 
@@ -355,6 +356,7 @@ NEXUS_API float nexus_verify_flash_attention(void) {
         size_t slot = pos % nexus::BLOCK_SIZE;
         auto* blk = kv_mgr.get_block(block_table[blk_idx]);
         size_t stride = num_kv_heads * nexus::BLOCK_SIZE * head_dim;
+        (void)stride;
         for (size_t h = 0; h < num_kv_heads; ++h) {
             float* k_ptr = blk->key_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
             float* v_ptr = blk->value_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
