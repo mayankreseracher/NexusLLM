@@ -13,9 +13,12 @@ The core research objective of NexusLLM is investigating **Dynamic Host RAM Para
 | **Dynamic Memory Tiering** | **Operational** | Pinned Host RAM (`VirtualAlloc` on Win, `mmap`/THP on Linux, UMA zero-copy on macOS Apple Silicon). |
 | **Double-Buffered Overlap (Phase 4)**| **Operational** | Ping-pong layer slots with asynchronous background worker prefetching layer $l+1$ while layer $l$ computes. |
 | **Paged KV Cache Management** | **Operational** | Block allocator with on-demand allocation, reference counting, and Radix tree prefix caching. |
+| **Memory Partition & Bucketed LRU** | **Operational** | Multi-tenant memory partitions (`MemoryPartition`, `PartitionManager`) with 3-tier Hot/Warm/Cold bucketed LRU ring buffers. |
+| **Head-Wise Paging** | **Operational** | Decoupled per-head page views (`HeadWisePage`) eliminating fragmentation across GQA ratios. |
+| **Sparse Attention Indexing (Spin)**| **Operational** | Dynamic coarse Key centroid evaluation (arXiv:2604.26837) pruning 60% of cold blocks ahead of token attention. |
 | **Transformer Forward Pass** | **Operational** | Complete mathematical execution: Token Embedding -> RMSNorm -> QKV GEMV -> RoPE -> PagedAttention Dot-Product & Softmax -> Wo -> RMSNorm -> SwiGLU FFN -> LM Head Logits -> Sampling. |
 | **Continuous Batching Scheduler**| **Operational** | Chunked prefill scheduling and iteration-level decode loop in C ABI and Python runtime. |
-| **Quantization & SIMD Kernels** | **Operational** | Fused quantized GEMV for GGUF Q4_0, Q8_0, FP16 via AVX2+FMA (x86_64) and ARM NEON (ARM64). |
+| **Quantization & SIMD Kernels** | **Operational** | Fused quantized GEMV for GGUF Q4_0, Q8_0, Q5_K, Q6_K, FP16 via AVX2+FMA (x86_64) and ARM NEON (ARM64). |
 | **Model Formats (Phase 3)** | **Operational** | Zero-copy binary memory mapping of `.gguf` v2/v3 files directly into Host RAM with full metadata extraction. |
 | **Hardware Backends (Phase 5)** | **Operational & Extensible** | Multi-device abstraction: NVIDIA CUDA, Apple Silicon Metal (with [CuMetal](https://github.com/Lulzx/cuda-metal) translation layer), AMD ROCm/HIP, Intel Arc oneAPI/SYCL, CPU SIMD fallback. |
 | **Distributed PD Disaggregation** | **Single-Node Prototype** | Queue-level decoupling of prefill and decode phases; multi-node RDMA network transport on roadmap. |
@@ -112,12 +115,13 @@ nexus_engine/
 ├── include/
 │   ├── nexus_common.hpp           # Platform detection, aligned types, hardware profiles
 │   ├── nexus_backend.hpp          # Hardware compute backends (CUDA, Metal, ROCm, SYCL, CPU)
-│   ├── memory_tier.hpp            # Tier 0 (Active) vs Tier 1 (Host RAM) manager
+│   ├── memory_tier.hpp            # Tier 0 (Active) vs Tier 1 (Host RAM) tier-split mapping manager
 │   ├── model_loader.hpp           # SafeTensors, GGUF v2/v3 zero-copy mmap parsers
-│   ├── paged_cache.hpp            # PagedAttention KV pool & Radix prefix tree
-│   ├── quantization.hpp           # SIMD dequantization & fused GEMV kernels
+│   ├── paged_cache.hpp            # PagedAttention KV pool & Radix prefix tree (Two-Level metadata)
+│   ├── partition_manager.hpp      # Memory partitions, Head-Wise page views, Bucketed LRU cache ring
+│   ├── quantization.hpp           # SIMD dequantization & fused GEMV kernels (Q4_0, Q8_0, Q5_K, Q6_K)
 │   ├── moe_router.hpp             # Dynamic MoE expert streaming & top-k routing
-│   ├── transformer_ops.hpp        # RMSNorm, RoPE, PagedAttention MHA/GQA, SwiGLU, Softmax, GEMV
+│   ├── transformer_ops.hpp        # RMSNorm, RoPE, Spin sparse attention indexing, SwiGLU, Softmax, GEMV
 │   ├── transformer_engine.hpp     # Full transformer forward pass pipeline with async prefetch
 │   ├── disaggregated_pipeline.hpp # Prefill-Decode disaggregation control plane
 │   └── nexus_abi.h                # Clean C ABI exports

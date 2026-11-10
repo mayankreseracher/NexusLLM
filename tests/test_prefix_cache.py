@@ -43,5 +43,20 @@ class TestPrefixCache(unittest.TestCase):
         # Verify hit rate calculation
         self.assertGreater(self.cache.get_hit_rate(), 0.5)
 
+    def test_partition_abstraction_and_bucketed_lru(self):
+        import ctypes
+        try:
+            from nexus_llm.bindings import find_nexus_library
+        except ImportError:
+            from nexus_engine.python.nexus_llm.bindings import find_nexus_library
+
+        lib_path = find_nexus_library()
+        lib = ctypes.CDLL(str(lib_path))
+        lib.nexus_verify_partition_and_bucketed_lru.restype = ctypes.c_int32
+        lib.nexus_verify_partition_and_bucketed_lru.argtypes = []
+
+        res = lib.nexus_verify_partition_and_bucketed_lru()
+        self.assertEqual(res, 0, f"nexus_verify_partition_and_bucketed_lru failed with code {res}")
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@
 #include "transformer_engine.hpp"
 #include "forward_pass.hpp"
 #include "nexus_backend.hpp"
+#include "partition_manager.hpp"
 
 namespace nexus {
     class EngineContext;
@@ -477,6 +478,28 @@ NEXUS_API void nexus_fused_gemv_fp8(const uint8_t* W_fp8,
                                    size_t cols, 
                                    float scale) {
     nexus::QuantizationKernel::fused_gemv_fp8(W_fp8, x, y, rows, cols, scale);
+}
+
+// Memory Partition & Bucketed LRU Verification ABI
+NEXUS_API int32_t nexus_verify_partition_and_bucketed_lru(void) {
+    auto kv_mgr = std::make_shared<nexus::PagedKVCacheManager>(64, 2, 4, 64);
+    auto part = nexus::PartitionManager::instance().create_partition("tenant_test", nexus::PartitionScope::ISOLATED_TENANT, 16, kv_mgr);
+    if (!part) return -1;
+
+    // Allocate 10 blocks (under budget)
+    auto b1 = part->allocate_blocks(10);
+    if (b1.size() != 10) return -2;
+
+    // Allocate 10 more blocks (exceeding budget of 16, triggers bucketed LRU eviction)
+    auto b2 = part->allocate_blocks(10);
+    if (b2.size() != 10) return -3;
+
+    // Test head-wise page descriptor extraction
+    auto hp = part->get_head_page(b2[0], 0, 1);
+    if (hp.head_index != 1 || hp.layer_index != 0) return -4;
+
+    nexus::PartitionManager::instance().remove_partition("tenant_test");
+    return 0; // Success
 }
 
 } // extern "C"
