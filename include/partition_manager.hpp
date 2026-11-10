@@ -83,18 +83,22 @@ public:
             const float* c_vec = blk->k_centroid + (layer_idx * c_stride) + (kv_head_idx * head_dim);
 
             float dot = 0.0f;
+            size_t d = 0;
 #if defined(NEXUS_HAVE_AVX2)
             __m256 vdot = _mm256_setzero_ps();
-            for (size_t d = 0; d < head_dim; d += 8) {
+            for (; d + 8 <= head_dim; d += 8) {
                 vdot = _mm256_fmadd_ps(_mm256_loadu_ps(query_vec + d), _mm256_loadu_ps(c_vec + d), vdot);
             }
             alignas(32) float arr[8];
             _mm256_store_ps(arr, vdot);
             dot = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
-#else
-            for (size_t d = 0; d < head_dim; ++d) dot += query_vec[d] * c_vec[d];
 #endif
-            scores.push_back({dot, blk_id});
+            for (; d < head_dim; ++d) {
+                dot += query_vec[d] * c_vec[d];
+            }
+            // Normalize by 1/sqrt(head_dim) for consistent cross-model threshold behavior
+            float norm_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            scores.push_back({dot * norm_factor, blk_id});
         }
 
         if (top_k < scores.size()) {
@@ -123,7 +127,7 @@ public:
 
 // ============================================================================
 // Issue 2: Spin 64-Bucket Recency Ring LRU
-// True temporal decay with O(1) access updates and O(64) bounded victim scan
+// True temporal decay with O(1) access updates, pinning support, and O(64) bounded victim scan
 // ============================================================================
 class BucketedLRUCache {
 public:
@@ -169,20 +173,60 @@ public:
                 }
             }
         }
-        // Place in oldest bucket for priority eviction
+        // Place in oldest bucket for priority eviction (unpinning if was pinned)
+        pinned_.erase(block_id);
         uint32_t oldest_bucket = (current_tick_ + 1) % NUM_BUCKETS;
         buckets_[oldest_bucket].push_front(block_id);
         block_bucket_[block_id] = oldest_bucket;
     }
 
-    // Victim selection: scans NUM_BUCKETS (64 slots) from oldest to newest tick: O(64) worst-case
+    // Fully delete block from bucket and map to prevent double-free
+    void remove(int32_t block_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pinned_.erase(block_id);
+        auto it = block_bucket_.find(block_id);
+        if (it != block_bucket_.end()) {
+            uint32_t old_bucket = it->second;
+            auto& old_list = buckets_[old_bucket];
+            for (auto dit = old_list.begin(); dit != old_list.end(); ++dit) {
+                if (*dit == block_id) {
+                    old_list.erase(dit);
+                    break;
+                }
+            }
+            block_bucket_.erase(it);
+        }
+    }
+
+    // Pinning support for mandatory pages
+    void pin(int32_t block_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pinned_.insert(block_id);
+    }
+
+    void unpin(int32_t block_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pinned_.erase(block_id);
+    }
+
+    bool is_pinned(int32_t block_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pinned_.find(block_id) != pinned_.end();
+    }
+
+    // Victim selection: scans NUM_BUCKETS (64 slots) from oldest to newest tick, skipping pinned blocks
     int32_t evict_next() {
         std::lock_guard<std::mutex> lock(mutex_);
         for (uint32_t i = 0; i < NUM_BUCKETS; ++i) {
             uint32_t idx = (current_tick_ + 1 + i) % NUM_BUCKETS;
-            if (!buckets_[idx].empty()) {
+            while (!buckets_[idx].empty()) {
                 int32_t victim = buckets_[idx].front();
                 buckets_[idx].pop_front();
+                if (pinned_.count(victim)) {
+                    // Skip pinned blocks - re-queue to the end of the bucket so it is preserved
+                    buckets_[idx].push_back(victim);
+                    break;
+                }
                 block_bucket_.erase(victim);
                 return victim;
             }
@@ -201,10 +245,11 @@ public:
     }
 
 private:
-    mutable std::mutex mutex_;
     uint32_t current_tick_ = 0;
     std::array<std::deque<int32_t>, NUM_BUCKETS> buckets_;
     std::unordered_map<int32_t, uint32_t> block_bucket_;
+    std::unordered_set<int32_t> pinned_;
+    mutable std::mutex mutex_;
 };
 
 // ============================================================================
@@ -303,6 +348,7 @@ public:
     void set_mandatory_budget(uint32_t mandatory_count) {
         std::lock_guard<std::mutex> lock(mutex_);
         budget_.mandatory_pages = mandatory_count;
+        update_pins_locked();
     }
 
     // Allocate physical blocks with eviction performed outside the partition mutex to avoid serialization
@@ -335,13 +381,15 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             for (int32_t b : blocks) {
                 allocated_blocks_.insert(b);
+                allocation_order_.push_back(b);
                 lru_.record_access(b, 1);
             }
+            update_pins_locked();
         }
         return blocks;
     }
 
-    // O(1) release using std::unordered_set membership
+    // O(1) release using std::unordered_set membership and full removal from LRU to prevent double-free
     void release_blocks(const std::vector<int32_t>& block_ids) {
         if (kv_mgr_) {
             kv_mgr_->release_blocks(block_ids);
@@ -349,8 +397,17 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for (int32_t b : block_ids) {
             allocated_blocks_.erase(b);
-            lru_.mark_evictable(b);
+            lru_.remove(b); // Fully remove from LRU ring to prevent double-free
         }
+        // Remove from allocation order
+        for (auto it = allocation_order_.begin(); it != allocation_order_.end(); ) {
+            if (std::find(block_ids.begin(), block_ids.end(), *it) != block_ids.end()) {
+                it = allocation_order_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        update_pins_locked();
     }
 
     // Resolves head-wise page descriptors with verified KVBlock layout offsets
@@ -384,12 +441,30 @@ public:
         lru_.record_access(block_id, ref_count);
     }
 
+    bool is_block_pinned(int32_t block_id) const {
+        return lru_.is_pinned(block_id);
+    }
+
 private:
+    void update_pins_locked() {
+        // Unpin all first
+        for (int32_t b : allocated_blocks_) {
+            lru_.unpin(b);
+        }
+        // Pin the most recent mandatory_pages from allocation order
+        size_t to_pin = std::min<size_t>(budget_.mandatory_pages, allocation_order_.size());
+        for (size_t i = 0; i < to_pin; ++i) {
+            size_t idx = allocation_order_.size() - 1 - i;
+            lru_.pin(allocation_order_[idx]);
+        }
+    }
+
     std::string partition_id_;
     PartitionScope scope_;
     RequestBudget budget_;
     std::shared_ptr<PagedKVCacheManager> kv_mgr_;
     std::unordered_set<int32_t> allocated_blocks_;
+    std::vector<int32_t> allocation_order_;
     BucketedLRUCache lru_;
     mutable std::mutex mutex_;
 };

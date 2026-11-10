@@ -526,9 +526,20 @@ NEXUS_API int32_t nexus_verify_partition_and_bucketed_lru(void) {
     if (sp.query_token_id != 42) return -7;
     if (sp.selected_page_ids.empty()) return -8;
 
-    // Test 5: O(1) release via unordered_set
+    // Test 5: O(1) release via unordered_set and verify full removal from LRU (prevent double-free)
+    size_t prev_lru = part->get_lru_size();
     part->release_blocks({b2[0]});
     if (part->get_allocated_count() != 9) return -9;
+    if (part->get_lru_size() >= prev_lru) return -10; // Must be strictly decremented
+
+    // Test 6: Verify mandatory blocks are pinned and protected from eviction
+    part->set_mandatory_budget(5);
+    // Allocate 10 blocks (budget is now 5 mandatory + 6 buffering = 11 total)
+    // Allocating 10 will trigger eviction, but the 5 mandatory pinned blocks must not be evicted
+    auto b3 = part->allocate_blocks(10);
+    if (b3.empty()) return -11;
+    // Check that recent mandatory blocks are flagged as pinned
+    if (!part->is_block_pinned(b3.back())) return -12;
 
     nexus::PartitionManager::instance().remove_partition("tenant_test");
     return 0; // All checks passed
