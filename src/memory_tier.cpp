@@ -82,6 +82,11 @@ MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_c
     }
 
     // DAK: Register Host RAM pool for Unified Virtual Addressing (UVA) & TMA direct DMA
+#if defined(__CUDACC__) || defined(NEXUS_ENABLE_CUDA)
+    if (tier1_raw_pool_ && tier1_capacity_ > 0) {
+        cudaHostRegister(tier1_raw_pool_, tier1_capacity_, cudaHostRegisterMapped | cudaHostRegisterPortable);
+    }
+#else
     NexusDLRHandle hCudart = nullptr;
 #if defined(NEXUS_PLATFORM_WINDOWS)
     hCudart = NEXUS_DLR_LOAD("cudart64_12.dll");
@@ -99,6 +104,7 @@ MemoryTierManager::MemoryTierManager(size_t tier0_capacity_bytes, size_t tier1_c
         }
         NEXUS_DLR_FREE(hCudart);
     }
+#endif
 
     // Launch background prefetch worker thread
     prefetch_thread_ = std::thread(&MemoryTierManager::prefetch_worker_loop, this);
@@ -112,6 +118,11 @@ MemoryTierManager::~MemoryTierManager() {
     }
 
     // DAK: Unregister Host RAM pool from CUDA UVA
+#if defined(__CUDACC__) || defined(NEXUS_ENABLE_CUDA)
+    if (tier1_raw_pool_) {
+        cudaHostUnregister(tier1_raw_pool_);
+    }
+#else
     NexusDLRHandle hCudart = nullptr;
 #if defined(NEXUS_PLATFORM_WINDOWS)
     hCudart = NEXUS_DLR_LOAD("cudart64_12.dll");
@@ -128,6 +139,7 @@ MemoryTierManager::~MemoryTierManager() {
         }
         NEXUS_DLR_FREE(hCudart);
     }
+#endif
 
 #if defined(NEXUS_PLATFORM_WINDOWS)
     if (tier0_raw_pool_) VirtualFree(tier0_raw_pool_, 0, MEM_RELEASE);

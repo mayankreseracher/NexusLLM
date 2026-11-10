@@ -3,12 +3,15 @@
 #include <cmath>
 #include <iostream>
 
-#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDACC__)
+#include <cuda_fp16.h>
+#if (__CUDA_ARCH__ >= 900)
 #include <cuda/barrier>
 #include <cooperative_groups.h>
 #include <cooperative_groups/cluster.h>
 #include <cuda_pipeline_primitives.h>
 namespace cg = cooperative_groups;
+#endif
 #endif
 
 namespace nexus {
@@ -74,7 +77,8 @@ cudaError_t create_tma_1d_kv_descriptor(
 // ============================================================================
 // 2. Hardware Hopper Kernel: Warp-Specialized Producer-Consumer with Multicast
 // ============================================================================
-#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDACC__)
+template <size_t HEAD_DIM>
 __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_attention_tma_multicast_kernel(
     const half* __restrict__ Q,                          // [num_heads, head_dim]
     const int32_t* __restrict__ block_table,            // Locality-ordered physical block IDs
@@ -87,6 +91,7 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
     float sm_scale,
     half* __restrict__ output
 ) {
+#if (__CUDA_ARCH__ >= 900)
     extern __shared__ uint8_t raw_smem[];
     constexpr size_t STAGE_COUNT = 2;
     const size_t bytes_per_stage = 16 * num_kv_heads * head_dim * sizeof(half) * 2;
@@ -102,10 +107,11 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
     int warp_id = tid / 32;
     int lane_id = tid % 32;
 
+    // Fix 1: Barrier deadlock fix. Expected arrivals = 1 (producer lane 0) + 224 (consumer threads) = 225
     if (tid == 0) {
         #pragma unroll
         for (int s = 0; s < STAGE_COUNT; ++s) {
-            init(&stage_barriers[s], blockDim.x);
+            init(&stage_barriers[s], 1 + (blockDim.x - 32));
         }
     }
     __syncthreads();
@@ -113,8 +119,16 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
     auto cluster = cg::this_cluster();
     bool is_cluster_master = (cluster.block_rank() == 0) && (warp_id == 0) && (lane_id == 0);
 
+    // Fix 4: Per-block head offset for Q and output (each blockIdx.x handles one head)
+    size_t head_idx = blockIdx.x;
+    size_t num_heads = gridDim.x;
+    size_t kv_head_idx = (num_kv_heads == num_heads) ? head_idx : (head_idx / (num_heads / num_kv_heads));
+
+    const half* q_head = Q + (head_idx * head_dim);
+    half* out_head = output + (head_idx * head_dim);
+
     // =========================================================================
-    // PRODUCER WARP (Warp 0): Issues TMA Async Fetches & Multicast (Issue 1 & 2)
+    // PRODUCER WARP (Warp 0): Issues TMA Async Fetches & Multicast
     // =========================================================================
     if (warp_id == 0) {
         for (size_t b = 0; b < num_blocks; ++b) {
@@ -124,21 +138,25 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
             if (is_tma_offloaded_mask[blk_id]) {
                 if (is_cluster_master) {
                     uint32_t cluster_mask = 0x3; // Spatial broadcast across 2 SMs in cluster
-                    uint64_t coord[1] = { static_cast<uint64_t>(blk_id * 16 * num_kv_heads * head_dim * 2) };
+                    // Fix 3: 32-bit coordinate for 1D tiled tensor map
+                    uint32_t coord = static_cast<uint32_t>(blk_id * 16 * num_kv_heads * head_dim * 2);
+                    // Fix 2: Proper generic-to-shared address conversion for SMEM buffer and mbarrier
+                    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_kv[stage]));
+                    uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&stage_barriers[stage]));
 
                     asm volatile(
                         "cp.async.bulk.tensor.shared::cluster.global.mbarrier::complete_tx::bytes"
                         " [%0], [%1, {%2}], [%3], %4;\n"
                         :
-                        : "r"(reinterpret_cast<uint32_t>(smem_kv[stage])),
+                        : "r"(smem_addr),
                           "l"(&tma_kv_map),
-                          "r"(coord[0]),
-                          "r"(reinterpret_cast<uint32_t>(&stage_barriers[stage])),
+                          "r"(coord),
+                          "r"(bar_addr),
                           "h"(cluster_mask)
                         : "memory"
                     );
                 }
-                // Producer signals transaction byte arrival (Issue 3)
+                // Producer signals transaction byte arrival (1 arrival count, bytes_per_stage tx bytes)
                 if (lane_id == 0) {
                     cuda::device::barrier_arrive_tx(stage_barriers[stage], 1, bytes_per_stage);
                 }
@@ -146,6 +164,7 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
                 for (size_t i = lane_id; i < (bytes_per_stage / sizeof(half)); i += 32) {
                     smem_kv[stage][i] = hbm_kv_pool[blk_id * (bytes_per_stage / sizeof(half)) + i];
                 }
+                __syncwarp();
                 if (lane_id == 0) {
                     cuda::device::barrier_arrive_tx(stage_barriers[stage], 1, bytes_per_stage);
                 }
@@ -158,23 +177,24 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
     else {
         float running_max = -1e20f;
         float running_sum = 0.0f;
-        float acc[128] = {0.0f};
+        // Fix 5: Templated accumulator size matching HEAD_DIM (prevents OOB)
+        float acc[HEAD_DIM] = {0.0f};
 
         for (size_t b = 0; b < num_blocks; ++b) {
             size_t stage = b % STAGE_COUNT;
 
-            // Arrive and wait on data arrival token (Issue 3)
+            // Arrive and wait on data arrival token
             auto token = stage_barriers[stage].arrive();
             stage_barriers[stage].wait(std::move(token));
 
-            half* k_stage = smem_kv[stage];
-            half* v_stage = smem_kv[stage] + (16 * head_dim);
+            const half* k_stage = smem_kv[stage] + (kv_head_idx * 16 * head_dim);
+            const half* v_stage = smem_kv[stage] + (16 * num_kv_heads * head_dim) + (kv_head_idx * 16 * head_dim);
 
             #pragma unroll
             for (int tok = 0; tok < 16; ++tok) {
                 float qk = 0.0f;
                 for (size_t d = 0; d < head_dim; ++d) {
-                    qk += __half2float(Q[d]) * __half2float(k_stage[tok * head_dim + d]);
+                    qk += __half2float(q_head[d]) * __half2float(k_stage[tok * head_dim + d]);
                 }
                 qk *= sm_scale;
 
@@ -191,10 +211,11 @@ __global__ void __launch_bounds__(256, 1) __cluster_dims__(2, 1, 1) dak_paged_at
         }
 
         float inv_sum = 1.0f / (running_sum + 1e-6f);
-        for (size_t d = tid; d < head_dim; d += (blockDim.x - 32)) {
-            output[d] = __float2half(acc[d] * inv_sum);
+        for (size_t d = (tid - 32); d < head_dim; d += (blockDim.x - 32)) {
+            out_head[d] = __float2half(acc[d] * inv_sum);
         }
     }
+#endif
 }
 #endif
 
@@ -216,24 +237,45 @@ void dak_paged_attention_tma_multicast_launch(
 ) {
     if (!Q || !block_table || num_blocks == 0 || !output) return;
 
-#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 900)
-    // Hardware Hopper TMA Launch path with Cluster Attribute
-    cudaLaunchConfig_t config = {0};
-    config.gridDim = dim3(num_heads, 1, 1);
-    config.blockDim = dim3(256, 1, 1);
-    config.dynamicSmemBytes = 2 * (16 * num_kv_heads * head_dim * sizeof(half) * 2);
+#if defined(__CUDACC__)
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.major >= 9) {
+        // Fix 5 (Launch): Hardware Hopper TMA Launch path with Cluster Dimension Attribute
+        cudaLaunchConfig_t config = {0};
+        config.gridDim = dim3(static_cast<uint32_t>(num_heads), 1, 1);
+        config.blockDim = dim3(256, 1, 1);
+        config.dynamicSmemBytes = 2 * (16 * num_kv_heads * head_dim * sizeof(half) * 2);
 
-    cudaLaunchAttribute cluster_attr[1];
-    cluster_attr[0].id = cudaLaunchAttributeClusterDimension;
-    cluster_attr[0].val.clusterDim.x = 2;
-    cluster_attr[0].val.clusterDim.y = 1;
-    cluster_attr[0].val.clusterDim.z = 1;
-    config.attrs = cluster_attr;
-    config.numAttrs = 1;
+        cudaLaunchAttribute cluster_attr[1];
+        cluster_attr[0].id = cudaLaunchAttributeClusterDimension;
+        cluster_attr[0].val.clusterDim.x = 2;
+        cluster_attr[0].val.clusterDim.y = 1;
+        cluster_attr[0].val.clusterDim.z = 1;
+        config.attrs = cluster_attr;
+        config.numAttrs = 1;
 
-    // Launch cudaLaunchKernelExC
-    // ...
-#else
+        if (head_dim <= 64) {
+            cudaLaunchKernelEx(&config, dak_paged_attention_tma_multicast_kernel<64>,
+                               reinterpret_cast<const half*>(Q), block_table, tma_desc->tensor_map,
+                               reinterpret_cast<const half*>(hbm_kv_pool), is_tma_offloaded_mask,
+                               num_blocks, head_dim, num_kv_heads, sm_scale, reinterpret_cast<half*>(output));
+        } else if (head_dim <= 128) {
+            cudaLaunchKernelEx(&config, dak_paged_attention_tma_multicast_kernel<128>,
+                               reinterpret_cast<const half*>(Q), block_table, tma_desc->tensor_map,
+                               reinterpret_cast<const half*>(hbm_kv_pool), is_tma_offloaded_mask,
+                               num_blocks, head_dim, num_kv_heads, sm_scale, reinterpret_cast<half*>(output));
+        } else {
+            cudaLaunchKernelEx(&config, dak_paged_attention_tma_multicast_kernel<256>,
+                               reinterpret_cast<const half*>(Q), block_table, tma_desc->tensor_map,
+                               reinterpret_cast<const half*>(hbm_kv_pool), is_tma_offloaded_mask,
+                               num_blocks, head_dim, num_kv_heads, sm_scale, reinterpret_cast<half*>(output));
+        }
+        return;
+    }
+#endif
+
     // Exact mathematical CPU simulation of the multi-stage DAK PagedAttention pipeline
     // Emulates the double-buffered SMEM stages (Host DRAM TMA direct fetch vs HBM pool)
     const float* host_dram_base = tma_desc ? reinterpret_cast<const float*>(tma_desc->host_dram_base_addr) : nullptr;
@@ -290,7 +332,6 @@ void dak_paged_attention_tma_multicast_launch(
             out_h[d] = acc[d] * inv_sum;
         }
     }
-#endif
 }
 
 } // namespace dak
