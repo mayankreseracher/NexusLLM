@@ -123,6 +123,9 @@ NEXUS_API int32_t nexus_step_speculative_verify(
 // Mathematical Verification: Computes max absolute difference between FlashAttention Tiled Online Softmax and Naive Attention
 NEXUS_API float nexus_verify_flash_attention(void);
 
+// Spin Sparse Attention Verification: Computes max absolute difference between Spin Sparse Attention and Naive Attention
+NEXUS_API float nexus_verify_spin_sparse_attention(void);
+
 // Local hardware memory accounting (strictly offline / zero telemetry)
 NEXUS_API void nexus_get_memory_stats(NexusEngineHandle engine, NexusLocalMemoryStats* out_stats);
 

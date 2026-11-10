@@ -525,6 +525,7 @@ int32_t ForwardPassExecutor::forward_token(
                     std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
                 }
                 if (slot + 1 > blk->tokens_occupied) blk->tokens_occupied = slot + 1;
+                blk->update_centroid(l, num_kv_heads_, head_dim_);
             }
         }
 

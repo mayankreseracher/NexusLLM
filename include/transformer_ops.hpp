@@ -10,6 +10,13 @@
 
 namespace nexus {
 
+// Spin (arXiv:2604.26837) Configuration parameters
+struct SpinConfig {
+    size_t min_blocks_for_pruning = 8; // Dense execution for <= 128 tokens
+    size_t recent_window_blocks = 2;   // Always evaluate the most recent 32 tokens
+    float retention_ratio = 0.40f;     // Retain top 40% of historical blocks
+};
+
 class TransformerOps {
 public:
     // Root Mean Square Normalization with flexible DataType support (FP32, FP16)
@@ -322,6 +329,164 @@ public:
             for (size_t fd = 0; fd < head_dim; ++fd) {
                 out_h[fd] *= inv_l;
             }
+#endif
+        }
+    }
+
+    // Spin (arXiv:2604.26837) Sparse Paged Attention
+    // Dynamically scores physical KV cache blocks using coarse Key centroids,
+    // pruning 60% of cold blocks before token-level FlashAttention online softmax.
+    static void paged_attention_decode_spin(
+        const float* Q,
+        const std::vector<int32_t>& block_table,
+        PagedKVCacheManager& kv_mgr,
+        size_t layer_idx,
+        size_t seq_len,
+        size_t num_heads,
+        size_t num_kv_heads,
+        size_t head_dim,
+        float* attn_out,
+        const SpinConfig& cfg = SpinConfig()
+    ) {
+        if (num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || block_table.empty()) return;
+        size_t total_blocks = block_table.size();
+
+        // Small sequence fast-path: dense paged attention
+        if (total_blocks <= cfg.min_blocks_for_pruning) {
+            paged_attention_decode(Q, block_table, kv_mgr, layer_idx, seq_len, num_heads, num_kv_heads, head_dim, attn_out);
+            return;
+        }
+
+        size_t kv_mul = num_heads / num_kv_heads;
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        size_t c_stride = num_kv_heads * head_dim;
+        size_t num_recent = std::min(cfg.recent_window_blocks, total_blocks);
+        size_t historical_blocks = total_blocks - num_recent;
+        size_t top_k_blocks = std::max<size_t>(1, static_cast<size_t>(historical_blocks * cfg.retention_ratio));
+
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (size_t h = 0; h < num_heads; ++h) {
+            size_t kv_h = h / kv_mul;
+            const float* q_h = Q + (h * head_dim);
+            float* out_h = attn_out + (h * head_dim);
+
+            // Stage 1: Coarse Centroid Filter across historical blocks
+            std::vector<std::pair<float, int32_t>> scores;
+            scores.reserve(historical_blocks);
+
+            for (size_t b = 0; b < historical_blocks; ++b) {
+                int32_t blk_id = block_table[b];
+                KVBlock* blk = kv_mgr.get_block(blk_id);
+                if (!blk || !blk->k_centroid || !blk->centroid_valid) {
+                    scores.push_back({0.0f, blk_id});
+                    continue;
+                }
+                const float* c_vec = blk->k_centroid + (layer_idx * c_stride) + (kv_h * head_dim);
+
+                float dot = 0.0f;
+#if defined(NEXUS_HAVE_AVX2)
+                __m256 vdot = _mm256_setzero_ps();
+                size_t d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    vdot = _mm256_fmadd_ps(_mm256_loadu_ps(q_h + d), _mm256_loadu_ps(c_vec + d), vdot);
+                }
+                alignas(32) float arr[8];
+                _mm256_store_ps(arr, vdot);
+                dot = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+                for (; d < head_dim; ++d) dot += q_h[d] * c_vec[d];
+#else
+                for (size_t d = 0; d < head_dim; ++d) dot += q_h[d] * c_vec[d];
+#endif
+                scores.push_back({dot, blk_id});
+            }
+
+            // Select top-K highest scoring historical blocks
+            if (top_k_blocks < scores.size()) {
+                std::partial_sort(scores.begin(), scores.begin() + top_k_blocks, scores.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+
+            // Stage 2: Fine-Grained FlashAttention online softmax over selected + recent window blocks
+            float m = -1e30f;
+            float l = 0.0f;
+            std::memset(out_h, 0, head_dim * sizeof(float));
+
+            auto evaluate_block = [&](int32_t blk_id) {
+                KVBlock* blk = kv_mgr.get_block(blk_id);
+                if (!blk || !blk->key_data || !blk->value_data || blk->tokens_occupied == 0) return;
+
+                size_t stride = num_kv_heads * BLOCK_SIZE * head_dim;
+                const float* k_base = blk->key_data + (layer_idx * stride) + (kv_h * BLOCK_SIZE * head_dim);
+                const float* v_base = blk->value_data + (layer_idx * stride) + (kv_h * BLOCK_SIZE * head_dim);
+
+                for (size_t slot = 0; slot < blk->tokens_occupied; ++slot) {
+                    const float* k_vec = k_base + (slot * head_dim);
+                    const float* v_vec = v_base + (slot * head_dim);
+
+                    float dot = 0.0f;
+#if defined(NEXUS_HAVE_AVX2)
+                    __m256 vdot = _mm256_setzero_ps();
+                    size_t d = 0;
+                    for (; d + 8 <= head_dim; d += 8) {
+                        vdot = _mm256_fmadd_ps(_mm256_loadu_ps(q_h + d), _mm256_loadu_ps(k_vec + d), vdot);
+                    }
+                    alignas(32) float arr[8];
+                    _mm256_store_ps(arr, vdot);
+                    dot = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
+                    for (; d < head_dim; ++d) dot += q_h[d] * k_vec[d];
+#else
+                    for (size_t d = 0; d < head_dim; ++d) dot += q_h[d] * k_vec[d];
+#endif
+                    float s = dot * scale;
+                    float m_prev = m;
+                    float m_new = (s > m_prev) ? s : m_prev;
+                    float alpha = std::exp(m_prev - m_new);
+                    float beta = std::exp(s - m_new);
+
+                    l = (l * alpha) + beta;
+                    m = m_new;
+
+#if defined(NEXUS_HAVE_AVX2)
+                    __m256 valpha = _mm256_set1_ps(alpha);
+                    __m256 vbeta = _mm256_set1_ps(beta);
+                    size_t vd = 0;
+                    for (; vd + 8 <= head_dim; vd += 8) {
+                        __m256 o_v = _mm256_loadu_ps(out_h + vd);
+                        __m256 v_v = _mm256_loadu_ps(v_vec + vd);
+                        o_v = _mm256_fmadd_ps(v_v, vbeta, _mm256_mul_ps(o_v, valpha));
+                        _mm256_storeu_ps(out_h + vd, o_v);
+                    }
+                    for (; vd < head_dim; ++vd) out_h[vd] = (out_h[vd] * alpha) + (beta * v_vec[vd]);
+#else
+                    for (size_t vd = 0; vd < head_dim; ++vd) out_h[vd] = (out_h[vd] * alpha) + (beta * v_vec[vd]);
+#endif
+                }
+            };
+
+            // Selected historical blocks
+            size_t act_count = std::min(top_k_blocks, scores.size());
+            for (size_t i = 0; i < act_count; ++i) {
+                evaluate_block(scores[i].second);
+            }
+            // Invariant recent window blocks
+            for (size_t i = historical_blocks; i < total_blocks; ++i) {
+                evaluate_block(block_table[i]);
+            }
+
+            // Final normalization
+            float inv_l = (l > 1e-12f) ? (1.0f / l) : 0.0f;
+#if defined(NEXUS_HAVE_AVX2)
+            __m256 vinv = _mm256_set1_ps(inv_l);
+            size_t fd = 0;
+            for (; fd + 8 <= head_dim; fd += 8) {
+                __m256 o_v = _mm256_loadu_ps(out_h + fd);
+                _mm256_storeu_ps(out_h + fd, _mm256_mul_ps(o_v, vinv));
+            }
+            for (; fd < head_dim; ++fd) out_h[fd] *= inv_l;
+#else
+            for (size_t fd = 0; fd < head_dim; ++fd) out_h[fd] *= inv_l;
 #endif
         }
     }

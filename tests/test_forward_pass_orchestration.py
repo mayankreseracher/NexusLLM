@@ -65,6 +65,9 @@ class TestForwardPassOrchestration(unittest.TestCase):
         self.lib.nexus_verify_flash_attention.restype = ctypes.c_float
         self.lib.nexus_verify_flash_attention.argtypes = []
 
+        self.lib.nexus_verify_spin_sparse_attention.restype = ctypes.c_float
+        self.lib.nexus_verify_spin_sparse_attention.argtypes = []
+
         self.engine = self.lib.nexus_create_engine(64 * 1024 * 1024, 256 * 1024 * 1024, 256)
         self.assertIsNotNone(self.engine)
 
@@ -141,6 +144,13 @@ class TestForwardPassOrchestration(unittest.TestCase):
         max_diff = self.lib.nexus_verify_flash_attention()
         print(f"[Test] FlashAttention Tiled Online Softmax Max Abs Difference: {max_diff:.8e}")
         self.assertLess(max_diff, 1e-4, f"FlashAttention max difference {max_diff} exceeded tolerance 1e-4")
+
+    def test_spin_sparse_paged_attention_equivalence(self):
+        """Tests Spin (arXiv:2604.26837) coarse Key centroid pruning vs dense FlashAttention."""
+        max_diff = self.lib.nexus_verify_spin_sparse_attention()
+        print(f"[Test] Spin Sparse Attention Max Abs Difference: {max_diff:.8e}")
+        # Spin is a lossy sparse approximation pruning ~60% of blocks; outputs align closely (within 0.50 L1 error)
+        self.assertLess(max_diff, 0.50, f"Spin Sparse Attention difference {max_diff} exceeded tolerance 0.50")
 
 if __name__ == "__main__":
     unittest.main()

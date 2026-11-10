@@ -19,6 +19,12 @@ struct KVBlock {
     size_t tokens_occupied = 0;
     std::vector<float> storage;
 
+    // Spin (arXiv:2604.26837) Page-level Key Centroid representation
+    // Stored as [num_layers * num_heads * head_dim]
+    float* k_centroid = nullptr;
+    std::vector<float> centroid_storage;
+    bool centroid_valid = false;
+
     KVBlock() = default;
     KVBlock(const KVBlock&) = default;
     KVBlock& operator=(const KVBlock&) = default;
@@ -32,12 +38,41 @@ struct KVBlock {
         }
         key_data = storage.data();
         value_data = storage.data() + half_stride;
+
+        size_t c_size = num_layers * num_heads * head_dim;
+        if (centroid_storage.size() < c_size) {
+            centroid_storage.resize(c_size, 0.0f);
+        }
+        k_centroid = centroid_storage.data();
     }
 
     void reset() {
         ref_count = 0;
         tokens_occupied = 0;
         last_accessed_timestamp = 0;
+        centroid_valid = false;
+    }
+
+    // Updates Key centroid for given layer across active tokens in this block
+    void update_centroid(size_t layer_idx, size_t num_heads, size_t head_dim) {
+        if (!key_data || !k_centroid || tokens_occupied == 0) return;
+        size_t stride = num_heads * BLOCK_SIZE * head_dim;
+        size_t c_stride = num_heads * head_dim;
+        float inv_n = 1.0f / static_cast<float>(tokens_occupied);
+
+        for (size_t h = 0; h < num_heads; ++h) {
+            float* c_vec = k_centroid + (layer_idx * c_stride) + (h * head_dim);
+            const float* k_base = key_data + (layer_idx * stride) + (h * BLOCK_SIZE * head_dim);
+
+            for (size_t d = 0; d < head_dim; ++d) {
+                float sum = 0.0f;
+                for (size_t s = 0; s < tokens_occupied; ++s) {
+                    sum += k_base[s * head_dim + d];
+                }
+                c_vec[d] = sum * inv_n;
+            }
+        }
+        centroid_valid = true;
     }
 };
 

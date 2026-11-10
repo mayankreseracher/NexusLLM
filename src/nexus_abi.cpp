@@ -391,6 +391,58 @@ NEXUS_API float nexus_verify_flash_attention(void) {
     return max_diff;
 }
 
+NEXUS_API float nexus_verify_spin_sparse_attention(void) {
+    const size_t num_heads = 4;
+    const size_t num_kv_heads = 4;
+    const size_t head_dim = 64;
+    const size_t seq_len = 160; // 10 blocks (triggers coarse centroid pruning with 8+ blocks)
+
+    nexus::PagedKVCacheManager kv_mgr(16, 1, num_kv_heads, head_dim);
+    size_t blocks_needed = (seq_len + nexus::BLOCK_SIZE) / nexus::BLOCK_SIZE;
+    auto block_table = kv_mgr.allocate_blocks(blocks_needed);
+
+    // Populate KV cache and compute centroids
+    for (size_t pos = 0; pos <= seq_len; ++pos) {
+        size_t blk_idx = pos / nexus::BLOCK_SIZE;
+        size_t slot = pos % nexus::BLOCK_SIZE;
+        auto* blk = kv_mgr.get_block(block_table[blk_idx]);
+        size_t stride = num_kv_heads * nexus::BLOCK_SIZE * head_dim;
+        for (size_t h = 0; h < num_kv_heads; ++h) {
+            float* k_ptr = blk->key_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
+            float* v_ptr = blk->value_data + (h * nexus::BLOCK_SIZE * head_dim) + (slot * head_dim);
+            for (size_t d = 0; d < head_dim; ++d) {
+                k_ptr[d] = std::sin(static_cast<float>(pos * 17 + h * 13 + d));
+                v_ptr[d] = std::cos(static_cast<float>(pos * 19 + h * 7 + d));
+            }
+        }
+        if (slot + 1 > blk->tokens_occupied) blk->tokens_occupied = slot + 1;
+        blk->update_centroid(0, num_kv_heads, head_dim);
+    }
+
+    std::vector<float> Q(num_heads * head_dim);
+    for (size_t i = 0; i < Q.size(); ++i) {
+        Q[i] = std::sin(static_cast<float>(i * 3 + 1));
+    }
+
+    std::vector<float> out_spin(num_heads * head_dim, 0.0f);
+    std::vector<float> out_dense(num_heads * head_dim, 0.0f);
+
+    nexus::TransformerOps::paged_attention_decode_spin(
+        Q.data(), block_table, kv_mgr, 0, seq_len, num_heads, num_kv_heads, head_dim, out_spin.data()
+    );
+
+    nexus::TransformerOps::paged_attention_decode(
+        Q.data(), block_table, kv_mgr, 0, seq_len, num_heads, num_kv_heads, head_dim, out_dense.data()
+    );
+
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < out_spin.size(); ++i) {
+        float diff = std::abs(out_spin[i] - out_dense[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    return max_diff;
+}
+
 NEXUS_API void nexus_get_memory_stats(NexusEngineHandle engine, NexusLocalMemoryStats* out_stats) {
     if (!engine || !out_stats) return;
     auto* eng = static_cast<InternalEngine*>(engine);
