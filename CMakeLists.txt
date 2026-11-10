@@ -14,9 +14,6 @@ endif()
 # Architecture & OS Specific Tuning
 if(MSVC)
     add_compile_options(/O2 /W3 /EHsc /arch:AVX2)
-    if(OpenMP_CXX_FOUND)
-        add_compile_options(/openmp)
-    endif()
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 elseif(APPLE)
     # macOS (Apple Silicon M-Series & Intel)
@@ -65,7 +62,7 @@ add_library(nexus_engine SHARED
 target_include_directories(nexus_engine PUBLIC include)
 target_compile_definitions(nexus_engine PRIVATE NEXUS_BUILD_DLL)
 
-if(OpenMP_CXX_FOUND)
+if(OpenMP_CXX_FOUND AND NOT MSVC)
     target_link_libraries(nexus_engine PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
@@ -76,7 +73,7 @@ endif()
 # Standalone benchmark executable
 add_executable(nexus_bench src/main_bench.cpp)
 target_link_libraries(nexus_bench PRIVATE nexus_engine)
-if(OpenMP_CXX_FOUND)
+if(OpenMP_CXX_FOUND AND NOT MSVC)
     target_link_libraries(nexus_bench PRIVATE OpenMP::OpenMP_CXX)
 endif()
 if(UNIX AND NOT APPLE)
